@@ -1097,14 +1097,19 @@ void main()
             float frag_elev = dot(Normal, poleVec);
             float sun_elev  = dot(sunDir, poleVec);
 
-            float sin_lat = abs(frag_elev);
-            float cos_lat = sqrt(max(0.0, 1.0 - sin_lat * sin_lat));
-            float lat_decay = pow(cos_lat, 7.5);
-            float form_factor = sin_lat * lat_decay * 5.0;
 
             float planet_radius_m = max(1.0, EyePosLocal.w);
-            float ring_inner_pr = RingsParams.x / planet_radius_m;
-            float ring_outer_pr = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m;
+            float ring_inner_pr = (RingsParams.x / planet_radius_m);
+            float ring_outer_pr = ((RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m);
+			float ring_outer_vis = ((1.5575/(1.5575 - tan(1/ring_outer_pr)))-1)/2+1;
+			
+			float sin_lat = abs(frag_elev);
+            float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat*ring_outer_vis));
+            float lat_decay = pow(cos_lat, 7.5);
+            float form_factor = sin_lat * lat_decay * 5;
+			
+			//float ring_inner_pr = RingsParams.x / planet_radius_m;
+            //float ring_outer_pr = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m;
 
             float dist_to_center_pr = 1.0;
 
