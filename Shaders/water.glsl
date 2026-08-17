@@ -604,6 +604,7 @@ void main()
 // Atmospheric Ringshine Illumination & Atmospheric Ground Inscattering
         // Concept & Inscattering: Donatelo200
         // Multi-Band Integral & Analytical Shadow Cylinder (shadow_occ): JustNoetic
+	#ifdef RINGSHINE
         #ifdef RINGS
         {
             vec3  sunDir = lightVec;
@@ -614,11 +615,14 @@ void main()
             float planet_radius_m = max(1.0, EyePosLocal.w);
             float ring_inner_pr = (RingsParams.x / planet_radius_m);
             float ring_outer_pr = ((RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m);
-			float ring_outer_vis = ((1.5575/(1.5575 - tan(1/ring_outer_pr)))-1)/2+1;
+			//float ring_outer_vis = ((1.5575/(1.5575 - tan(1/ring_outer_pr)))-1)/2+1;
+			float ring_outer_vis = pow((pi/2)/acos(1/ring_outer_pr),0.5);
+			float in_out_ratio = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w)))/ RingsParams.x;
 			
-			float sin_lat = abs(frag_elev);
-            float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat*ring_outer_vis));
-            float lat_decay = pow(cos_lat, 7.5);
+			
+			float sin_lat = abs(frag_elev)*ring_outer_vis;
+            float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat));
+            float lat_decay = pow(cos_lat, 1.57 + in_out_ratio);
             float form_factor = sin_lat * lat_decay * 5;
 			
 			//float ring_inner_pr = RingsParams.x / planet_radius_m;
@@ -706,7 +710,7 @@ void main()
             #endif
         }
         #endif
-
+	#endif
     }
 
     // Modulate ambient lighting by surface color
