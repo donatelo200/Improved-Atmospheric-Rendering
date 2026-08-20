@@ -1,15 +1,7 @@
 #auto_version
 
-//===========================================================================//
-//                                                                           //
-//              SpaceEngine water surface rendering shader                   //
-//                                                                           //
-//===========================================================================//
+// Lujo water shader
 
-// Defines passed from SpaceEngine. Possible defines:
-// Effects:           	RINGS, ECL, ATMO, VSDBL, PLANEMO
-// Debug:               SQT
-// Vendor-specific:     INTEL, LOGVS, LOGFS
 #auto_defines
 
 #ifdef LOGFS
@@ -26,85 +18,24 @@
 
 #define SHADOW (defined(RINGS) || defined(ECL) || !defined(ATMO))
 
-//===========================================================================//
-//                                                                           //
-//                            Texture samplers                               //
-//                                                                           //
-//===========================================================================//
+// Texture 
 
 #ifdef ATMO
-/*  0 */ uniform sampler2D irradianceSampler;    // precomputed skylight irradiance (E table)
-/*  1 */ uniform sampler2D transmittanceSampler; // precomputed transmittance (T table)
-/*  2 */ uniform sampler3D inscatterSampler;     // precomputed inscattered light (S table)
+ uniform sampler2D irradianceSampler;
+ uniform sampler2D transmittanceSampler;
+ uniform sampler3D inscatterSampler;
 #endif
 
 #ifdef RINGS
-/*  3 */ uniform sampler2D RingsMap;
+ uniform sampler2D RingsMap;
 #endif
 
-/*  4 */ uniform sampler2D NoiseMap;
 
-//===========================================================================//
-//                                                                           //
-//                                Uniforms                                   //
-//                                                                           //
-//===========================================================================//
-
-//#ifdef ATMO
-//uniform vec4    AtmoParams1;    // density, scattering bright, skylight bright, exposure
-//uniform vec4    AtmoParams2;    // MieG, MieFade, HR, HM
-//uniform vec4    AtmoParams3;    // planet_radius^2, atmoH^2, atmoH, mieG^2
-//uniform vec3    AtmoRayleigh;   // betaR
-//uniform vec3    AtmoMieExt;     // betaMExt
-//uniform vec2    AtmoColAdjust;  // hsl color adjust
-//#endif
-//
-//uniform vec4    Radiuses;       // atmosphere bottom radius, atmosphere top radius, atmosphere height, surface radius
-//uniform vec4    NodeCenter;     // node center offset, heightmap scale
-//uniform ivec4   VSFetchParams;  // uIndex, vIndex, nTiles, mode
-//uniform mat3x3  FaceRotation;   // terrain cube face oreintation
-//uniform mat4x4  ModelViewProj;  // modelview * projection matrix
-//
-//uniform int     NLights;                 // lights count
-//uniform vec3    LightPos   [MAX_LIGHTS]; // Object-space light position
-//uniform vec3    LightColor [MAX_LIGHTS]; // Light color
-//uniform vec3    LightParams[MAX_LIGHTS]; // Light radius, light luminosity, light specular power
-//
-//#ifdef ECL  
-//uniform vec4    EclipseCasters[MAX_LIGHTS * MAX_ECLIPSES];
-//#endif
-//
-//uniform vec4    AmbientColor;   // Ambient color, eclipse shadow intensity
-//uniform vec4    GlowColor;      // Glow color, glow mode
-//uniform vec4    WaterSurfColor; // Water surface diffuse color, water on/off animation
-//uniform vec4    WaterFogColor;  // Underwater absorption RGB, underwater absorption global
-//uniform vec4    EyePos;         // Object-space camera position, minEyeMu
-//uniform vec4    EyePosLocal;    // Object-space camera position relative to the node center, surface radius
-//uniform vec4    SpecParams;     // ice specular bright, water specular bright, ice specular power, water specular power
-//uniform vec4    SurfParams1;    // eclipse shadow mask, horizon fake fresnel raise, Hapke to Lambert coefficient, isEarthSpecMap
-//uniform vec4    SurfParams2;    // heightmap scale, day ambient coefficient, subsurface scattering brightness, subsurface scattering power
-//uniform vec4    SurfParams3;    // face, detail texture frequency x/y, animation time
-//uniform vec4    SurfParams4;    // city lights cutoff brightness, night light brightness, perm light brightness, ---
-//uniform vec4    SurfParams5;    // surface brightness calibration, water brightness calibration, ambient brightness calibration, ---
-//uniform vec4    RingsParams;    // rings inner radius, rings outer radius, rings density, rings inv width
-//uniform vec4    WaterParams;    // water depth, water layer radius, inv water fade height, water horizon opacity
-//uniform vec4    EllipsGrav;     // planet ellipsoid oblateness, ellipsoid gravity coefficient
-//
-//#ifdef SQT
-//uniform vec4   NodeColor;       // grid color for octree node visualization
-//#endif
-//
-//#if (defined(LOGFS) || defined(LOGVS))
-//uniform float  LogZParams;      // logFactor
-//#endif
+// Uniforms
 
 #uniform_block
 
-//===========================================================================//
-//                                                                           //
-//           Variables, shared with the atmospheric scattering code          //
-//                                                                           //
-//===========================================================================//
+// Variables, shared with the atmospheric scattering code
 
 vec3  FragPos       = vec3(0.0,0.0,0.0);
 float FragR         = 0.0;
@@ -125,7 +56,7 @@ vec3  Attenuation   = vec3(1.0,1.0,1.0);
 const float pi   = 3.14159265359;
 const float pi2  = pi * 2.0;
 const float pi05 = pi * 0.5;
-const vec3  FaceBitangent = vec3(0.0, 0.01, 0.0); // step vector mask to compute tangents
+const vec3  FaceBitangent = vec3(0.0, 0.01, 0.0);
 
 #include "hsl.glh"
 #include "terrain_pbr.glh"
@@ -143,30 +74,180 @@ const vec3  FaceBitangent = vec3(0.0, 0.01, 0.0); // step vector mask to compute
 #include "eclipse_common.glh"
 #endif
 
-//===========================================================================//
-//                                                                           //
-//                             Vertex shader                                 //
-//                                                                           //
-//===========================================================================//
+// Wave model
+
+#define OCEAN_DRAG_MULT             0.42
+
+#define OCEAN_SPEED                 1.0       // DO NOT CHANGE THIS. NEVER EVER. IT WILL BREAK SEAM FIX. YOU CAN CHANGE OCEAN SPEED IN OCEAN_TIME_DIVISOR. ALWAYS BY FACOR OF 2.(8,16,32..)
+#define OCEAN_PHASE_WRAP      1048576.0
+
+#define OCEAN_TIME_DIVISOR         32.0
+
+#define OCEAN_VERTEX_ITERATIONS     24
+#define OCEAN_NORMAL_ITERATIONS     48
+#define OCEAN_GEOM_COORD_SCALE      48.0
+#define OCEAN_NORMAL_COORD_SCALE    20.0
+#define OCEAN_DISPLACEMENT_KM       0.0250
+#define OCEAN_HEIGHT_CENTER         0.500
+#define OCEAN_NORMAL_STRENGTH       1.00
+#define OCEAN_NORMAL_EPS_KM         0.0030
+#define OCEAN_NORMAL_FADE_START_KM  60.0
+#define OCEAN_NORMAL_FADE_END_KM    180.0
+
+// FoAm
+
+#define OCEAN_FOAM_ENABLE_CREST       1
+#define OCEAN_FOAM_ENABLE_TRAILS      0
+
+#define OCEAN_FOAM_CREST_START        0.54
+#define OCEAN_FOAM_CREST_END          0.70
+#define OCEAN_FOAM_SLOPE_START        0.08
+#define OCEAN_FOAM_SLOPE_END          0.42
+#define OCEAN_FOAM_CREST_AMOUNT       0.90
+
+#define OCEAN_FOAM_HISTORY_ITERATIONS 5
+#define OCEAN_FOAM_TRAIL_DELAY_1      0.0065
+#define OCEAN_FOAM_TRAIL_DELAY_2      0.0135
+#define OCEAN_FOAM_TRAIL_DELAY_3      0.0225
+#define OCEAN_FOAM_TRAIL_DELAY_4      0.0340
+#define OCEAN_FOAM_TRAIL_WEIGHT_1     0.82
+#define OCEAN_FOAM_TRAIL_WEIGHT_2     0.62
+#define OCEAN_FOAM_TRAIL_WEIGHT_3     0.42
+#define OCEAN_FOAM_TRAIL_WEIGHT_4     0.24
+#define OCEAN_FOAM_TRAIL_CREST_BIAS   0.065
+#define OCEAN_FOAM_TRAIL_AMOUNT       0.80
+
+#define OCEAN_FOAM_DETAIL_MIN         0.22
+#define OCEAN_FOAM_DETAIL_MAX         0.72
+#define OCEAN_FOAM_DISTANCE_START     15.0
+#define OCEAN_FOAM_DISTANCE_END       90.0
+
+#define OCEAN_FOAM_SPARSE_CREST_POWER   3.60
+
+#define OCEAN_FOAM_SPARSE_SLOPE_POWER   1.60
+
+#define OCEAN_FOAM_SPARSE_DETAIL_START  0.58
+#define OCEAN_FOAM_SPARSE_DETAIL_END    0.86
+
+#define OCEAN_FOAM_CREST_TIP_MIN        0.14
+
+#define OCEAN_FOAM_BRIGHTNESS         0.72
+#define OCEAN_FOAM_DARK_BRIGHTNESS    0.035
+#define OCEAN_FOAM_LIGHT_COLOR_MIX    0.30
+const vec3 OCEAN_FOAM_COLOR = vec3(0.78, 0.83, 0.86);
+
+vec2 OceanWaveDx3D(vec3 position, vec3 direction, float frequency, float timeshift)
+{
+    float x = dot(direction, position) * frequency + timeshift;
+    float wave = exp(sin(x) - 1.0);
+    float dx = wave * cos(x);
+    return vec2(wave, -dx);
+}
+
+vec3 OceanMacroWarp3D(vec3 p)
+{
+    vec3 q = p * 0.0043;
+
+    float wx = sin(dot(q, vec3( 0.91,  1.37, -0.73)) + 1.41)
+             + sin(dot(q, vec3(-1.17,  0.61,  1.09)) - 2.13);
+    float wy = sin(dot(q, vec3(-0.67,  1.11,  1.43)) + 2.71)
+             + sin(dot(q, vec3( 1.29, -0.83,  0.57)) + 0.37);
+    float wz = sin(dot(q, vec3( 1.41,  0.53,  0.89)) - 1.07)
+             + sin(dot(q, vec3(-0.79, -1.31,  0.71)) + 2.29);
+
+    return vec3(wx, wy, wz) * 11.0;
+}
+
+float GetFastOceanWaves3D(vec3 position, int iterations, float cyclicTime)
+{
+    position += OceanMacroWarp3D(position);
+
+    float wavePhaseShift = length(position) * 0.073
+                         + dot(position, vec3(0.0137, 0.0211, -0.0173));
+    float iter = 0.0;
+    float frequency = 1.0;
+    float weight = 1.0;
+    float sumOfValues = 0.0;
+    float sumOfWeights = 0.0;
+    float loopPhase = cyclicTime * pi2 * 24.0;
+
+    for (int i = 0; i < iterations; i++)
+    {
+        float fi = float(i);
+
+        vec3 dir = normalize(vec3(
+            sin(iter + fi * 0.37),
+            cos(iter * 0.971 + fi * 0.19),
+            sin(iter * 0.731 + 1.337 + fi * 0.53)
+        ));
+
+        float octavePhase = fract(sin(fi * 91.345 + 17.17) * 47453.5453) * pi2;
+
+        float timeMultiplier = 2.0 + float(i / 3);
+        vec2 res = OceanWaveDx3D(position, dir, frequency,
+                                 loopPhase * timeMultiplier
+                               + wavePhaseShift + octavePhase);
+
+        position += dir * res.y * weight * OCEAN_DRAG_MULT;
+
+        sumOfValues += res.x * weight;
+        sumOfWeights += weight;
+
+        weight *= 0.8;
+
+        frequency *= 1.16 + 0.035 * fract(sin(fi * 37.11 + 4.7) * 15731.743);
+        iter += 1232.399963;
+    }
+
+    return sumOfValues / max(sumOfWeights, 1.0e-6);
+}
+
+float GetOceanDisplacementKm(vec3 sphereDir, float radiusKm, float cyclicTime)
+{
+
+    vec3 wavePos = sphereDir * radiusKm * OCEAN_GEOM_COORD_SCALE;
+    float h = GetFastOceanWaves3D(wavePos, OCEAN_VERTEX_ITERATIONS, cyclicTime);
+    return (h - OCEAN_HEIGHT_CENTER) * OCEAN_DISPLACEMENT_KM;
+}
+
+// seam fix (please god let this one work)
+
+vec3 OceanPlanetDirFromTexCoord(vec2 texCoord)
+{
+    float nTiles = max(float(VSFetchParams.z), 1.0);
+    float size2  = 2.0 / nTiles;
+    vec2 uv      = vec2(texCoord.x, 1.0 - texCoord.y);
+    vec2 offs    = vec2(VSFetchParams.xy) * size2 - 1.0;
+    vec3 cube    = vec3(offs + uv * size2, 1.0);
+    return normalize(FaceRotation * normalize(cube));
+}
+
+float OceanGlobalPhase()
+{
+    float nTiles = max(float(VSFetchParams.z), 1.0);
+    float cycles = max(floor(OCEAN_PHASE_WRAP / nTiles + 0.5), 1.0);
+
+    float commonClock = SurfParams3.w * cycles * OCEAN_SPEED;
+
+    return fract(commonClock / OCEAN_TIME_DIVISOR);
+}
+
+// Vertex shader
 
 #ifdef _VERTEX_
 
-// Vertex shader input
 layout(location = 0) in  vec3  vTexCoord;
 
-// Vertex shader output
 out vec4 fPosition;
 out vec3 fPositionLocal;
 out vec3 fTangent;
 out vec2 fWavesTexCoord;
-
-//-----------------------------------------------------------------------------
+out float fWaveHeight;
 
 void    SphereVertexCoordF(out vec3 pos, out vec3 tangent)
 {
     vec2 uv = vec2(pi05) - vec2(pi2, pi) * vTexCoord.xy;
 
-    // compute position
     float sinu = sin(uv.x);
     float cosu = cos(uv.x);
     float sinv = sin(uv.y);
@@ -175,7 +256,6 @@ void    SphereVertexCoordF(out vec3 pos, out vec3 tangent)
     pos.y = sinv;
     pos.z = cosv * sinu;
 
-    // compute tangent vector
     vec3 pos0 = normalize(pos - FaceBitangent);
     vec3 pos1 = normalize(pos + FaceBitangent);
     tangent   = pos0 - pos1;
@@ -185,21 +265,16 @@ void    SphereVertexCoordF(out vec3 pos, out vec3 tangent)
         tangent = normalize(tangent);
 }
 
-//-----------------------------------------------------------------------------
-
 void    SphereSegmentVertexCoordF(out vec3 pos, out vec3 tangent)
 {
     float size2 = 2.0 / float(VSFetchParams.z);
     vec2  uv = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
 
-    // compute node offset with high precision
     vec2  offs  = vec2(VSFetchParams.xy) * size2 - 1.0;
 
-    // compute position
     pos.xy = offs + uv * size2;
     pos.z  = 1.0;
 
-    // compute tangent vector
     vec3 pos0 = normalize(pos - FaceBitangent);
     vec3 pos1 = normalize(pos + FaceBitangent);
     pos       = normalize(pos);
@@ -210,21 +285,16 @@ void    SphereSegmentVertexCoordF(out vec3 pos, out vec3 tangent)
         tangent = normalize(tangent);
 }
 
-//-----------------------------------------------------------------------------
-
 void    SphereSegmentVertexCoordD(out dvec3 pos, out dvec3 tangent)
 {
     double size2 = 2.0 / double(VSFetchParams.z);
     dvec2  uv = dvec2(vTexCoord.x, 1.0 - vTexCoord.y);
 
-    // compute node offset with high precision
     dvec2  offs  = dvec2(VSFetchParams.xy) * size2 - 1.0;
 
-    // compute position
     pos.xy = offs + uv * size2;
     pos.z  = 1.0;
 
-    // compute tangent vector
     dvec3 pos0 = normalize(pos - FaceBitangent);
     dvec3 pos1 = normalize(pos + FaceBitangent);
     pos        = normalize(pos);
@@ -235,72 +305,80 @@ void    SphereSegmentVertexCoordD(out dvec3 pos, out dvec3 tangent)
         tangent = normalize(tangent);
 }
 
-//=============================================================================
-// Vertex shader entry point
-
 void main()
 {
-    // Transfer the detail texture coordinates
-    fWavesTexCoord = vTexCoord.xy;
 
-    // Perform calcultations in double precision only for fine levels
+    fWavesTexCoord = vTexCoord.xy;
+    fWaveHeight = 0.0;
+
+    float oceanPhase = OceanGlobalPhase();
+
     #ifdef VSDBL
 
-        // Calculate the vertex position on the planet sphere and tangent space vector
         dvec3 dvPosition, dvTangent;
         SphereSegmentVertexCoordD(dvPosition, dvTangent);
-        dvec3 dvPosLocal = dvPosition - dvec3(NodeCenter.xyz);
-        fPosition.xyz    = vec3(dvPosition);
-        fPositionLocal   = vec3(dvPosLocal * double(EyePosLocal.w));
-        fTangent         = vec3(dvTangent);
 
-        // Calculate the output position
+        vec3 waveSphereDir = OceanPlanetDirFromTexCoord(vTexCoord.xy);
+        float displacementKm = GetOceanDisplacementKm(waveSphereDir,
+                                                       EyePosLocal.w,
+                                                       oceanPhase);
+        double radialScale = 1.0 + double(displacementKm / max(EyePosLocal.w, 1.0e-6));
+        dvPosition *= radialScale;
+
+        dvec3 dvPosLocal = dvPosition - dvec3(NodeCenter.xyz);
+        fPosition.xyz  = vec3(dvPosition);
+        fPositionLocal = vec3(dvPosLocal * double(EyePosLocal.w));
+        fTangent       = vec3(dvTangent);
+        fWaveHeight    = displacementKm;
+
         gl_Position = ModelViewProj * vec4(dvPosLocal, 1.0);
 
     #else
 
-        // Calculate the vertex position on the planet sphere and tangent space vector
         if (VSFetchParams.w < 0.0)
-            SphereVertexCoordF(fPosition.xyz, fTangent);        // base level (sphere)
+            SphereVertexCoordF(fPosition.xyz, fTangent);
         else
-            SphereSegmentVertexCoordF(fPosition.xyz, fTangent); // other levels (spherical quadreee patch)
-        vec3 fvPosLocal = fPosition.xyz - NodeCenter.xyz;
-        fPositionLocal  = vec3(fvPosLocal * EyePosLocal.w);
+            SphereSegmentVertexCoordF(fPosition.xyz, fTangent);
 
-        // Calculate the output position
+        vec3 baseSphereDir = normalize(fPosition.xyz);
+
+        vec3 waveSphereDir = (VSFetchParams.w >= 0.0)
+            ? OceanPlanetDirFromTexCoord(vTexCoord.xy)
+            : normalize(FaceRotation * baseSphereDir);
+
+        float displacementKm = GetOceanDisplacementKm(waveSphereDir,
+                                                       EyePosLocal.w,
+                                                       oceanPhase);
+        fPosition.xyz = baseSphereDir
+                      * (1.0 + displacementKm / max(EyePosLocal.w, 1.0e-6));
+
+        vec3 fvPosLocal = fPosition.xyz - NodeCenter.xyz;
+        fPositionLocal = fvPosLocal * EyePosLocal.w;
+        fWaveHeight = displacementKm;
+
         gl_Position = ModelViewProj * vec4(fvPosLocal, 1.0);
 
     #endif
 
-
-    // Logarithmic depth buffer:
-    // calculate the per-vertex logarithmic depth value in vertex shader (LOGVS mode),
-    // or transfer it to the fragment shader for further per-fragment calculation (LOGFS mode)
-	#ifdef LOGVS
+    #ifdef LOGVS
         gl_Position.z = (log2(max(1.0e-6, 1.0 + gl_Position.w)) * LogZParams - 1.0) * gl_Position.w;
     #endif
-	#ifdef LOGFS
+    #ifdef LOGFS
         fPosition.w = gl_Position.z;
     #endif
 }
+#endif
 
-#endif // _VERTEX_
-
-//===========================================================================//
-//                                                                           //
-//                            Fragment shader                                //
-//                                                                           //
-//===========================================================================//
+// Fragment shader
 
 #ifdef _FRAGMENT_
 
-// Fragment shader input
 in vec4 fPosition;
 in vec3 fPositionLocal;
 in vec3 fTangent;
 in vec2 fWavesTexCoord;
+in float fWaveHeight;
 
-// Fragment shader output
 #ifdef INTEL
 out vec4 FragColor;
 #else
@@ -311,28 +389,19 @@ layout(location = 0) out vec4 FragColor;
 layout(depth_less) out float gl_FragDepth;
 #endif
 
-//=============================================================================
-// Fragment shader entry point
-
 void main()
 {
-    // Logarithmic depth buffer:
-    // calculate the per-pixel logarithmic depth value (LOGFS mode)
     #ifdef LOGFS
         gl_FragDepth = log2(1.0 + fPosition.w) * LogZParams;
     #endif
 
-    // Get normal
     vec3  Normal  = normalize(fPosition.xyz);
-
-    // Calculate precise fragment position and eye vector in object space
     FragR   = Radiuses.w;
     FragPos = Normal * FragR;
     eyeVec  = FragPos - EyePos.xyz;
     eyeVecLength = length(eyeVec);
 
-    // Switch to vertex-precise coordinates close to the camera
-    if (eyeVecLength < 50.0) // km
+    if (eyeVecLength < 50.0)
     {
         float t = smoothstep(2.0, 50.0, eyeVecLength);
         vec3  FragPosP = fPositionLocal + NodeCenter.xyz * EyePosLocal.w;
@@ -344,43 +413,28 @@ void main()
         eyeVecLength = length(eyeVec);
     }
 
-    // Calculate water fade
     float waterFade3D = eyeVecLength * WaterParams.z - 1.0;
     if (waterFade3D > 1.0) discard;
     waterFade3D = clamp(waterFade3D, 0.0, 1.0);
-    //waterFade3D *= waterFade3D;
     #ifdef WATER_HARD_TRANSITION
         waterFade3D = step(1.0, waterFade3D);
     #endif
     waterFade3D = 1.0 - waterFade3D;
 
-    float wavesFade = clamp(2.0 - eyeVecLength * 0.1, 0.0, 1.0);
-    wavesFade *= wavesFade;
-
-    // Get tangent
     vec3  Tangent = normalize(fTangent);
-
-    // Calculate matrix of transformation to tangent space
     mat3x3 Rotation = mat3x3(Tangent, cross(Tangent, Normal), Normal);
-
-    // Calculate fragment position for the eclipse shadow
     #ifdef ECL
         vec3  FragPosS = FragPos * EllipsGrav.xyz;
     #endif
 
     eyeVec /= eyeVecLength;
 
-    // Calculate fragment and eye parameters for atmosphere
     #ifdef ATMO
-        // NOTE: 3D water is flat (FragH == 0.0), so equations are simplified (to remove artifacts)
-        //FragH  = (FragR - Radiuses.x) / Radiuses.z;
         FragH  = 0.0;
         FragMu = dot(FragPos, eyeVec) / FragR;
         EyeR   = length(EyePos.xyz);
         EyeH   = (EyeR - Radiuses.x) / Radiuses.z;
         EyeMu  = dot(EyePos.xyz, eyeVec) / EyeR;
-
-        // if EyePos in space, move it to nearest intersection of ray with top atmosphere boundary
         EyePosM = EyePos.xyz;
         float d = -EyeR * EyeMu - sqrt(max(EyeR * EyeR * (EyeMu * EyeMu - 1.0) + Radiuses.y * Radiuses.y, 0.0));
         if (d > 0.0)
@@ -395,112 +449,121 @@ void main()
         EyeR = length(EyePos.xyz);
     #endif
 
-    // Calculate the underwater fog (using actual eyeVecLength only
-    // when camera is under water, from air/space view it is either 0 or 1)
     bool  isAboveWater = (EyeR > WaterParams.y);
     float underWaterDist = isAboveWater ? 0.0f : eyeVecLength;
     vec4  waterAttenuation = clamp(exp(-underWaterDist * WaterFogColor), 0.0, 1.0);
-    float waterOpacity     = 1.0 - waterAttenuation.a;
+    float waterOpacity     = 1 - waterAttenuation.a;
 
-    // Get waves normal vector
-    vec2 uv0 = (vec2(0.17, 0.65 + SurfParams3.w) + fWavesTexCoord) * SurfParams3.yz;
-    vec2 uv1 = (vec2(0.65, 0.83 - SurfParams3.w) + fWavesTexCoord) * SurfParams3.yz;
-    vec2 uv2 = (vec2(0.41, 0.44 + SurfParams3.w) + fWavesTexCoord) * SurfParams3.yz * 4.0;
-    vec2 uv3 = (vec2(0.28, 0.37 - SurfParams3.w) + fWavesTexCoord) * SurfParams3.yz * 4.0;
+    vec3 eyeVecTS = eyeVec * Rotation;
 
-    vec3  wavesNormal =
-        texture(NoiseMap, uv0).xyz +
-        texture(NoiseMap, uv1).xyz +
-        texture(NoiseMap, uv2).xyz +
-        texture(NoiseMap, uv3).xyz;
+// proc ocean nrmals
 
-    wavesNormal = normalize(0.5 * wavesNormal - 1.0);
+    float oceanNormalFade = 1.0 - smoothstep(OCEAN_NORMAL_FADE_START_KM,
+                                              OCEAN_NORMAL_FADE_END_KM,
+                                              eyeVecLength);
+    oceanNormalFade *= oceanNormalFade;
 
-    vec3  normVec = normalize(wavesNormal * wavesFade + vec3(0.0, 0.0, 1.0));
+    vec3 normVec = vec3(0.0, 0.0, 1.0);
+    float oceanDetailHeight = OCEAN_HEIGHT_CENTER;
+    float oceanSlopeMagnitude = 0.0;
 
-    // Calculate eye vector in the tangent space
-    vec3  eyeVecTS = eyeVec * Rotation;
+    float oceanPhase = OceanGlobalPhase();
+
+    if (oceanNormalFade > 1.0e-4)
+    {
+        vec3 Bitangent = normalize(cross(Tangent, Normal));
+
+        vec3 waveNormal = (VSFetchParams.w >= 0.0)
+            ? OceanPlanetDirFromTexCoord(fWavesTexCoord)
+            : normalize(FaceRotation * Normal);
+        vec3 waveTangent   = normalize(FaceRotation * Tangent);
+        vec3 waveBitangent = normalize(FaceRotation * Bitangent);
+        vec3 wavePos = waveNormal * FragR * OCEAN_NORMAL_COORD_SCALE;
+        float sampleStep = OCEAN_NORMAL_EPS_KM * OCEAN_NORMAL_COORD_SCALE;
+
+        float h0 = GetFastOceanWaves3D(wavePos,
+                                       OCEAN_NORMAL_ITERATIONS,
+                                       oceanPhase);
+        float hT = GetFastOceanWaves3D(wavePos + waveTangent * sampleStep,
+                                       OCEAN_NORMAL_ITERATIONS,
+                                       oceanPhase);
+        float hB = GetFastOceanWaves3D(wavePos + waveBitangent * sampleStep,
+                                       OCEAN_NORMAL_ITERATIONS,
+                                       oceanPhase);
+
+        float slopeT = (hT - h0) * OCEAN_DISPLACEMENT_KM
+                     / OCEAN_NORMAL_EPS_KM;
+        float slopeB = (hB - h0) * OCEAN_DISPLACEMENT_KM
+                     / OCEAN_NORMAL_EPS_KM;
+
+        oceanDetailHeight = h0;
+        oceanSlopeMagnitude = length(vec2(slopeT, slopeB));
+
+        vec3 oceanNormalTS = normalize(vec3(-slopeT * OCEAN_NORMAL_STRENGTH,
+                                             -slopeB * OCEAN_NORMAL_STRENGTH,
+                                              1.0));
+        normVec = normalize(mix(vec3(0.0, 0.0, 1.0),
+                                oceanNormalTS,
+                                oceanNormalFade));
+    }
 
     #if (defined(ATMO) && !defined(PLANEMO))
         float sqrtFragH = sqrt(FragH);
     #endif
 
-    // Uderwater fog
     vec3 waterFogAccum = AmbientColor.rgb;
-
-    // Initial PBR surface parameters
     float metallic  = 0.0;
-    float specSea   = SpecParams.y;
-    float roughSea  = SpecParams.w;
+    float specSea   = max(SpecParams.y, 1.0);
+
+    float roughSea  = clamp(SpecParams.w * 0.30, 0.020, 0.070);
     float aoSea     = 1.0;
-
-    // Calculate the atmospheric scattering
     #ifdef ATMO
-
-        // Atmospheric attenuation along ray from the ground to the viewer
         #ifdef ANALYTIC_TRANSM
             Attenuation = transmittanceAnalytic(EyeR, max(EyeMu, EyePos.w), eyeVecLength);
         #else
             Attenuation = transmittance(sqrt(EyeH), EyeMu, sqrtFragH, FragMu);
         #endif
 
-        // Atmospheric scattering along ray from the ground to the viewer
         #ifndef PLANEMO
-
-			// Fix discontinuity artifact at the horizon by interpolating values above and below the horizon
             bool atmoHorFix = false;
-
-			#ifdef HORIZON_FIX
+            #ifdef HORIZON_FIX
                 float invR = Radiuses.x / EyeR;
                 HorizonMu = -sqrt(1.0 - invR * invR);
                 HorizonFixEps = AtmoParams1.w;
                 atmoHorFix = abs(EyeMu - HorizonMu) < HorizonFixEps;
-			#endif // HORIZON_FIX
-
+            #endif
             vec3 Inscatter = vec3(0.0);
+        #endif
+    #endif
 
-        #endif // PLANEMO
-
-    #endif // ATMO
-
-    // Calculate lighting values
     float NdotV = clamp(-dot(normVec, eyeVecTS), 0.0, 1.0);
     vec3  diffSeaAccum = vec3(0.0);
     vec3  specSeaAccum = vec3(0.0);
     vec3  ambSeaAccum  = AmbientColor.rgb * WaterSurfColor.rgb;
+    vec3  foamLightAccum = AmbientColor.rgb * 0.30;
     float EclipseMask  = 1.0;
-
-    vec3  testS = vec3(0.0);
-
     for (int i=0; i<NLights; i++)
     {
-        // Calculate light vectors in object space
         vec3 lightPos = LightPos[i] - FragPos;
         vec3 lightVec = normalize(lightPos);
-
-        // Calculate light vectors in tangent space
         vec3 lightVecTS = lightVec * Rotation;
-
-        // Calculate direct sun lighting
         float NdotLS  = dot(Normal, lightVec);
         float NdotLSC = clamp(NdotLS, 0.0, 1.0);
 
-        // Calculate inverse light distance
 	    #ifdef ECL
 			vec3  lightPosEll = lightPos * EllipsGrav.xyz;
-			float invLightDist = inversesqrt(dot(lightPosEll, lightPosEll));
-	    #endif
+            float invLightDist = inversesqrt(dot(lightPosEll, lightPosEll));
+        #endif
 
-        // Set up atmospheric scattering variables
         #ifdef ATMO
             EyeMuS = dot(EyePosM, lightVec) / EyeR;
-            MieHorFade = smoothstep(0.0, AtmoParams2.y, EyeMuS); // Fade to avoid imprecision problems in Mie scattering when sun is below horizon
+            MieHorFade = smoothstep(0.0, AtmoParams2.y, EyeMuS);
         #endif
 
 	    // Rings and eclipse shadows
         vec3 ShadowColor = vec3(1.0);
 
-	    #if (SHADOW && !defined(PLANEMO))
+	    #if (SHADOW && !defined(PLANEMO) && defined(BLOODMOON))
 
             // Rings shadow
             #ifdef RINGS
@@ -532,76 +595,69 @@ void main()
 
         #endif // shadows
 
+        #if (SHADOW && !defined(PLANEMO) && !defined(BLOODMOON))
+            #ifdef RINGS
+                vec2  shadowProj;
+                float cosPhi;
+                if (SurfParams3.x == 0.0)
+                {
+                    shadowProj = (fPosition.xz - lightPos.xz * min(fPosition.y / lightPos.y, 0.0)) * EllipsGrav.xz;
+                    cosPhi = abs(lightVec.y);
+                }
+                else
+                {
+                    shadowProj = (fPosition.xy - lightPos.xy * min(fPosition.z / lightPos.z, 0.0)) * EllipsGrav.xy;
+                    cosPhi = abs(lightVec.z);
+                }
+                float texU = (length(shadowProj) * EyePosLocal.w - RingsParams.x) * RingsParams.w;
+                ShadowColor *= RingsShadow(texU, cosPhi);
+            #endif
+            #ifdef ECL
+				float lightAngularRadius = asin(clamp(LightParams[i].x * invLightDist, 0.0, 1.0));
+                float eclipse = EclipseShadowFar(i, MAX_ECLIPSES, FragPosS, lightPosEll * invLightDist, lightAngularRadius);
+                ShadowColor *= 1.0 - AmbientColor.a * eclipse;
+                eclipse *= step(0.0, dot(lightPosEll, FragPosS));
+                EclipseMask *= 1.0 - eclipse;
+            #endif
+        #endif
 
-
-        // Planetary sphere shadow
-        // TODO: take into account sun angular size
-        // NOTE: 3D water is flat (rr == 1.0), so equations are simplified (to remove artifacts)
-        //float rr = Radiuses.x / FragR;
-        //float cosHor = sqrt(1.0 - rr*rr);
-        //float HorShadow = clamp((cosHor + NdotLS) * 500.0, 0.0, 1.0);
         float HorShadow = clamp(NdotLS * 500.0, 0.0, 1.0);
-
-        // Direct sun light color, modulated by shadows
         vec3  sunLight = LightColor[i].rgb * ShadowColor;
-        float Shadow   = (ShadowColor.r + ShadowColor.g + ShadowColor.b) * 0.33333;
-
-        // Direct sun light color, attenuatied by atmosphere, or modulated by planetary sphere shadow
         vec3 sunLightHorShadow = sunLight * HorShadow;
         #ifdef ATMO
             sunLightHorShadow *= transmittanceDens(sqrtFragH, NdotLS);
         #endif
 
-        // Calculate lighting value
         float NdotL = clamp(dot(normVec, lightVecTS), 0.0, 1.0);
-        float VdotL = clamp(-dot(lightVec, eyeVec), -0.999, 1.0);
-
-        // Get the normal and "flat surface" lighting color
         vec3 sunLightN = sunLightHorShadow * NdotL;
         vec3 sunLightW = sunLightHorShadow * NdotLSC;
-
-        // Fake daytime ambient lighting
-        vec3 ambSeaTerm = LightColor[i].rgb * (NdotLSC * Shadow * SurfParams2.y);
-        //ambSeaTerm *= WaterSurfColor.rgb;
-
-        // Add sky irradiance
+        vec3 ambSeaTerm = LightColor[i].rgb * (NdotLSC * ShadowColor * SurfParams2.y);
         #ifdef ATMO
-            vec3 skyIrrad = irradiance(FragH, NdotLS) * sunLight * AtmoParams1.z;
-            sunLightW  += skyIrrad;			  
+            vec3 skyIrrad = irradiance(FragH, NdotLS) * sunLight * ShadowColor * AtmoParams1.z;
+            sunLightW  += skyIrrad;
             ambSeaTerm += skyIrrad;
-        #endif // ATMO
+        #endif
 
-        // Fade out fake day ambient under water
-        //ambSeaTerm *= 1.0 - waterOpacity;
+        foamLightAccum += sunLightW * (0.25 + 0.75 * NdotL);
 
-        // Accumulate uderwater fog color
         waterFogAccum += sunLightW;
-
-        // PBR workflow
         vec3  diffSeaTerm = vec3(0.0);
         vec3  specSeaTerm = vec3(0.0);
-
-        // Cook-Torrance BRDF
         CookTorranceBRDF(normVec, eyeVecTS, lightVecTS, NdotV, NdotL,
             WaterSurfColor.rgb, roughSea, aoSea, metallic,
             diffSeaTerm, specSeaTerm);
-
-        // Accumulate ambient, diffuse and specular terms
         ambSeaAccum  += ambSeaTerm;
         diffSeaAccum += diffSeaTerm * sunLightN;
         specSeaAccum += specSeaTerm * sunLightN;
-
-        //if (i == 0) testS = SurfParams2.yyy;
-
-        // Calculate the atmospheric scattering along ray from ground to observer
-	    #ifdef ATMO
+        #ifdef ATMO
             if (atmoHorFix)
                 Inscatter += inscatterGroundFix(lightVec) * sunLight;
             else
                 Inscatter += inscatterGround(lightVec) * sunLight;
-	    #endif
-
-// Atmospheric Ringshine Illumination & Atmospheric Ground Inscattering
+        #endif
+    
+	
+	// Atmospheric Ringshine Illumination & Atmospheric Ground Inscattering
         // Concept & Inscattering: Donatelo200
         // Multi-Band Integral & Analytical Shadow Cylinder (shadow_occ): JustNoetic
 	#ifdef RINGSHINE
@@ -711,100 +767,151 @@ void main()
         }
         #endif
 	#endif
-    }
+	
+	}
 
-    // Modulate ambient lighting by surface color
     ambSeaAccum *= WaterSurfColor.rgb;
-
-    // Apply brightness calibration
     diffSeaAccum *= SurfParams5.x;
     specSeaAccum *= SurfParams5.x * specSea;
     ambSeaAccum  *= SurfParams5.z;
 
-    // Apply the underwater fog
     waterFogAccum *= WaterSurfColor.rgb * SurfParams5.y;
     diffSeaAccum = mix(diffSeaAccum * waterAttenuation.rgb, waterFogAccum, waterOpacity);
     specSeaAccum = mix(specSeaAccum * waterAttenuation.rgb, vec3(0.0),     waterOpacity);
     ambSeaAccum  = mix(ambSeaAccum  * waterAttenuation.rgb, vec3(0.0),     waterOpacity);
 
-	// Calculate surface color
     vec3  surfaceColor = specSeaAccum * waterFade3D;
-
     float opacity = 0.0;
     float alpha = 0.0;
     #ifndef WATER_SPECULAR_ONLY
-        //if (!isAboveWater)
-        //{
-            // Calculate the water surface opacity (waterOpacity is valid only from underwater view)
-            // WaterParams.w > 1 makes water surface opaque near horzion:
-            // terrestrial  planets: to hide atmo scattering on underwater terrain
-            // superoceanic planets: to hide planet's solid core when viewed from space
-            float fresAlpha = clamp(0.02 + WaterParams.w * 0.98 * pow(1.0 - abs(dot(eyeVecTS, normVec)), 4), 0.0, 1.0);
-            opacity = clamp(waterOpacity + fresAlpha, 0.0, 1.0);
+        float fresAlpha = clamp(0.02 + WaterParams.w * 0.98
+                              * pow(1.0 - abs(dot(eyeVecTS, normVec)), 5.0),
+                                0.0, 1.0);
+        opacity = clamp(waterOpacity + fresAlpha, 0.0, 1.0);
+        alpha = clamp(opacity * WaterSurfColor.a * waterFade3D + 0.12, 0.0, 1.0);
+        surfaceColor += (diffSeaAccum + ambSeaAccum) * alpha;
 
-            alpha = opacity * WaterSurfColor.a * waterFade3D;
-            //alpha = opacity * WaterSurfColor.a * wavesFade;
-            //alpha = 1.0;
-
-            // Add water diffuse and ambient color (simulate GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA blening eqution)
-            surfaceColor += (diffSeaAccum + ambSeaAccum) * alpha;
-        //}
+        vec3 targetScatter = vec3(0.0293, 0.0698, 0.1717);
+        vec3 scatterColor = mix(WaterSurfColor.rgb, targetScatter, 0.45);
+        float scatterAmount = (1.0 - fresAlpha) * 0.10
+                            * (isAboveWater ? 1.0 : 0.0) * waterFade3D;
+        surfaceColor += scatterColor * scatterAmount;
     #endif
 
-	// Apply the atmospheric scattering
+// Proc foam setting
+
+    float broadWaveHeight = clamp(fWaveHeight / max(OCEAN_DISPLACEMENT_KM, 1.0e-6)
+                                  + OCEAN_HEIGHT_CENTER, 0.0, 1.0);
+    float foamCrest = smoothstep(OCEAN_FOAM_CREST_START,
+                                 OCEAN_FOAM_CREST_END,
+                                 broadWaveHeight);
+
+    float foamSlope = smoothstep(OCEAN_FOAM_SLOPE_START,
+                                 OCEAN_FOAM_SLOPE_END,
+                                 oceanSlopeMagnitude);
+
+    float sparseCrest = pow(clamp(foamCrest, 0.0, 1.0),
+                            OCEAN_FOAM_SPARSE_CREST_POWER);
+
+    float breakingGate = pow(clamp(foamSlope, 0.0, 1.0),
+                             OCEAN_FOAM_SPARSE_SLOPE_POWER);
+    breakingGate = OCEAN_FOAM_CREST_TIP_MIN
+                 + (1.0 - OCEAN_FOAM_CREST_TIP_MIN) * breakingGate;
+
+    float freshFoam = sparseCrest * breakingGate
+                    * OCEAN_FOAM_CREST_AMOUNT;
+
+    float foamDetail = smoothstep(OCEAN_FOAM_DETAIL_MIN,
+                                  OCEAN_FOAM_DETAIL_MAX,
+                                  oceanDetailHeight);
+    foamDetail = smoothstep(OCEAN_FOAM_SPARSE_DETAIL_START,
+                            OCEAN_FOAM_SPARSE_DETAIL_END,
+                            foamDetail);
+
+    float trailFoam = 0.0;
+    #if OCEAN_FOAM_ENABLE_TRAILS
+        vec3 foamWaveNormal = (VSFetchParams.w >= 0.0)
+            ? OceanPlanetDirFromTexCoord(fWavesTexCoord)
+            : normalize(FaceRotation * Normal);
+        vec3 foamWavePos = foamWaveNormal * FragR * OCEAN_GEOM_COORD_SCALE;
+
+        float t1 = fract(oceanPhase - OCEAN_FOAM_TRAIL_DELAY_1 + 1.0);
+        float t2 = fract(oceanPhase - OCEAN_FOAM_TRAIL_DELAY_2 + 1.0);
+        float t3 = fract(oceanPhase - OCEAN_FOAM_TRAIL_DELAY_3 + 1.0);
+        float t4 = fract(oceanPhase - OCEAN_FOAM_TRAIL_DELAY_4 + 1.0);
+
+        float oldH1 = GetFastOceanWaves3D(foamWavePos, OCEAN_FOAM_HISTORY_ITERATIONS, t1);
+        float oldH2 = GetFastOceanWaves3D(foamWavePos, OCEAN_FOAM_HISTORY_ITERATIONS, t2);
+        float oldH3 = GetFastOceanWaves3D(foamWavePos, OCEAN_FOAM_HISTORY_ITERATIONS, t3);
+        float oldH4 = GetFastOceanWaves3D(foamWavePos, OCEAN_FOAM_HISTORY_ITERATIONS, t4);
+
+        float histStart = OCEAN_FOAM_CREST_START - OCEAN_FOAM_TRAIL_CREST_BIAS;
+        float histEnd   = OCEAN_FOAM_CREST_END   - OCEAN_FOAM_TRAIL_CREST_BIAS;
+        float trail1 = smoothstep(histStart, histEnd, oldH1) * OCEAN_FOAM_TRAIL_WEIGHT_1;
+        float trail2 = smoothstep(histStart, histEnd, oldH2) * OCEAN_FOAM_TRAIL_WEIGHT_2;
+        float trail3 = smoothstep(histStart, histEnd, oldH3) * OCEAN_FOAM_TRAIL_WEIGHT_3;
+        float trail4 = smoothstep(histStart, histEnd, oldH4) * OCEAN_FOAM_TRAIL_WEIGHT_4;
+
+        trailFoam = max(max(trail1, trail2), max(trail3, trail4));
+
+        trailFoam *= (1.0 - 0.35 * foamCrest) * OCEAN_FOAM_TRAIL_AMOUNT;
+    #endif
+
+    float crestLayer = 0.0;
+    #if OCEAN_FOAM_ENABLE_CREST
+        crestLayer = freshFoam;
+    #endif
+
+
+    float foamDistanceFade = 1.0 - smoothstep(OCEAN_FOAM_DISTANCE_START,
+                                               OCEAN_FOAM_DISTANCE_END,
+                                               eyeVecLength);
+
+    float foamMask = max(crestLayer, trailFoam);
+    foamMask *= foamDetail * foamDistanceFade * waterFade3D
+              * (isAboveWater ? 1.0 : 0.0);
+    foamMask = clamp(foamMask, 0.0, 1.0);
+
+    vec3 foamHDR = max(foamLightAccum, vec3(0.0));
+    float foamHDRMax = max(foamHDR.r, max(foamHDR.g, foamHDR.b));
+
+    float foamLightCompressed = foamHDRMax / (1.0 + foamHDRMax);
+
+    vec3 foamLightTint = (foamHDRMax > 1.0e-6)
+                       ? foamHDR / foamHDRMax
+                       : vec3(1.0);
+    foamLightTint = mix(vec3(1.0), foamLightTint, OCEAN_FOAM_LIGHT_COLOR_MIX);
+
+    float foamBrightness = mix(OCEAN_FOAM_DARK_BRIGHTNESS,
+                               OCEAN_FOAM_BRIGHTNESS,
+                               foamLightCompressed);
+    vec3 foamLitColor = OCEAN_FOAM_COLOR * foamLightTint * foamBrightness;
+
+    surfaceColor = mix(surfaceColor, foamLitColor, foamMask);
+
+    alpha = mix(alpha, WaterSurfColor.a * waterFade3D, foamMask);
+
     #ifdef ATMO
-
-        // Atmospheric attenuation along ray from the ground to the viewer
         surfaceColor *= Attenuation;
-
-        // Atmospheric scattering along ray from the ground to the viewer
         #ifndef PLANEMO
-        
-		    // Calculate the surface color affected by the atmosphere
             surfaceColor += Inscatter;
-        
-            // Subtract atmospheric scattering from water layer to eye,
-            // because it was already computed via previous surface (terrain)
             surfaceColor -= Inscatter * (1.0 - alpha);
-        
-        #endif // PLANEMO
+        #endif
+    #endif
 
-    #endif // ATMO
-
-    // Calculate the result color
     FragColor.rgb = surfaceColor;
-    //FragColor.rgb *= alpha;
-    //FragColor.rgb *= opacity * WaterSurfColor.a;
-    //FragColor.rgb *= waterFade3D;
-    //FragColor.rgb *= WaterSurfColor.a;
-
     FragColor.a = alpha;
 
-    // Display the eclipse shadow mask
     #if (SHADOW && !defined(PLANEMO))
         FragColor.b += SurfParams1.x * step(EclipseMask, 0.0);
     #endif
 
-    // Limit the brightness while preserving color
     float luma = max(FragColor.r, max(FragColor.g, FragColor.b));
     FragColor.rgb *= clamp(65000.0 / (luma + 1.0e-10), 0.0, 1.0);
-
-    // Display debug node boundaries
     #ifdef SQT
         float tileEdge = 1.0 - smoothstep(0.5, 0.48, abs(0.5 - fWavesTexCoord.x)) * smoothstep(0.5, 0.48, abs(0.5 - fWavesTexCoord.y));
         FragColor.rgb = mix(FragColor.rgb, NodeColor.rgb, tileEdge);
     #endif
-
-    //FragColor.rgb = testS;
-    //FragColor.rgb = waterFogAccum;
-    //FragColor.rgb = ambSeaAccum;
-    //FragColor.rgb = specSeaAccum;
-    //FragColor.rgb = vec3(alpha);
-    //FragColor.rgb = vec3(waterOpacity);
-    //FragColor.rgb = Inscatter;
-    //FragColor.a = 1.0;
 }
 
-#endif // _FRAGMENT_
-
-//=============================================================================
+#endif
