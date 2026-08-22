@@ -47,26 +47,50 @@ const float MIN_MU_S = 0.2;
 //#define HOR_FIX_ALL
 //-----------------------------------------------------------------------------
 
+// Bruneton 2017 "New Implementation" mapping - must stay bit-for-bit
+// consistent with texture4D() in ag_common.glh, since that shader WRITES
+// this texture and this one READS it. See ag_common.glh for the derivation
+// notes; Rg/Rt here are Radiuses.x/Radiuses.y (same values AtmoParams3.x/y/z
+// were precomputed from, i.e. Rg*Rg, H*H and H respectively).
 vec4 texture4D(float r, float mu, float muS, float tex4Dlerpi, float tex4Dlerpf)
 {
-    float rho2 = max(r * r - AtmoParams3.x, 0.0);
-    float rho = sqrt(rho2);
+    float Rg = Radiuses.x;
+    float Rt = Radiuses.y;
+    float H  = AtmoParams3.z;                     // sqrt(Rt*Rt - Rg*Rg)
+    float rho = sqrt(max(r * r - AtmoParams3.x, 0.0));
+    float uR = 0.5 / float(RES_R) + rho / H * (1.0 - 1.0 / float(RES_R));
+
     float rmu = r * mu;
-    float delta = rmu * rmu - rho2;
-    vec4  cst = ((rmu < 0.0) && (delta > 0.0)) ? vec4(1.0, 0.0, 0.0, 0.5 - 0.5 / float(RES_MU)) : vec4(-1.0, AtmoParams3.y, AtmoParams3.z, 0.5 + 0.5 / float(RES_MU));
-    float uR = 0.5 / float(RES_R) + rho / AtmoParams3.z * (1.0 - 1.0 / float(RES_R));
+    float discriminant = rmu * rmu - r * r + AtmoParams3.x; // AtmoParams3.x = Rg*Rg
+    float uMu;
+    if (mu < 0.0 && discriminant >= 0.0)
+    {
+        // ray hits the ground: lower half of the texture, [0, 0.5)
+        float d    = -rmu - sqrt(max(discriminant, 0.0));
+        float dMin = r - Rg;
+        float dMax = rho;
+        float x    = (dMax > dMin) ? (d - dMin) / (dMax - dMin) : 0.0;
+        uMu = 0.5 - 0.5 * (0.5 / float(RES_MU / 2) + x * (1.0 - 1.0 / float(RES_MU / 2)));
+    }
+    else
+    {
+        // ray reaches the top of the atmosphere: upper half, [0.5, 1]
+        float d    = -rmu + sqrt(max(discriminant + AtmoParams3.y, 0.0)); // AtmoParams3.y = H*H
+        float dMin = Rt - r;
+        float dMax = rho + H;
+        float x    = (d - dMin) / (dMax - dMin);
+        uMu = 0.5 + 0.5 * (0.5 / float(RES_MU / 2) + x * (1.0 - 1.0 / float(RES_MU / 2)));
+    }
 
-    //float uMu = cst.w + (rmu * cst.x + sqrt(delta + cst.y)) / (rho + cst.z) * (0.5 - 1.0 / float(RES_MU));
-
-    float uMu = cst.w;
-    if (rho + cst.z > 0.0)
-        uMu += (rmu * cst.x + sqrt(delta + cst.y)) / (rho + cst.z) * (0.5 - 1.0 / float(RES_MU));
-
-    // paper formula
-    float uMuS = 0.5 / float(RES_MU_S) + max((1.0 - exp(-3.0 * muS - 0.6)) / (1.0 - exp(-3.6)), 0.0) * (1.0 - 1.0 / float(RES_MU_S));
-
-    // better formula
-    //float uMuS = 0.5 / float(RES_MU_S) + (atan(max(muS, -0.1975) * tan(1.26 * 1.1)) / 1.1 + (1.0 - 0.26)) * 0.5 * (1.0 - 1.0 / float(RES_MU_S));
+    float muSMin = -MIN_MU_S;
+    float dMinS  = Rt - Rg;
+    float dMaxS  = H;
+    float dS     = -Rg * muS    + sqrt(max(Rg * Rg * (muS * muS       - 1.0) + Rt * Rt, 0.0));
+    float DS     = -Rg * muSMin + sqrt(max(Rg * Rg * (muSMin * muSMin - 1.0) + Rt * Rt, 0.0));
+    float a      = (dS - dMinS) / (dMaxS - dMinS);
+    float A      = (DS - dMinS) / (dMaxS - dMinS);
+    float xMuS   = max(1.0 - a / A, 0.0) / (1.0 + a);
+    float uMuS   = 0.5 / float(RES_MU_S) + xMuS * (1.0 - 1.0 / float(RES_MU_S));
 
     vec3 uvw = vec3((tex4Dlerpi + uMuS) * INV_RES_NU, uMu, uR);
     vec4 col1 = texture(inscatterSampler, uvw);
@@ -112,11 +136,20 @@ vec3 irradiance(float h, float muS)
 // transmittance(transparency) of atmosphere for infinite ray (r,mu)
 // (mu=cos(view zenith angle)), intersections with ground ignored
 // h - relative height (h = (r - planRadius) / atmoHeight)
+// Bruneton 2017 mapping for the mu axis (must match getTransmittanceUV() in
+// ag_common.glh, since that shader wrote this texture). r is reconstructed
+// from sqrth so the texture's own R-axis storage (and every call site that
+// already computes sqrth) doesn't need to change.
 vec3 transmittance(float sqrth, float mu)
 {
-    //float uMu = atan((mu + 0.15) / (1.0 + 0.15) * tan(1.5)) / 1.5;
-    //float uMu = atan((mu + 0.18) / (1.0 + 0.18) * tan(1.5)) / 1.5;
-    float uMu = atan(mu * 11.950355887 + 2.1510640597) * 0.6666666667;
+    float Rg = Radiuses.x;
+    float Rt = Radiuses.y;
+    float r  = Rg + sqrth * sqrth * (Rt - Rg);
+    float H  = AtmoParams3.z;                     // sqrt(Rt*Rt - Rg*Rg)
+    float d    = -r * mu + sqrt(max(r * r * (mu * mu - 1.0) + Rt * Rt, 0.0));
+    float dMin = Rt - r;
+    float dMax = sqrt(max(r * r - AtmoParams3.x, 0.0)) + H;
+    float uMu  = (d - dMin) / max(dMax - dMin, 1e-6);
     return texture(transmittanceSampler, vec2(uMu, sqrth)).rgb;
 }
 
