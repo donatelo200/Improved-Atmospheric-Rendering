@@ -85,9 +85,9 @@ const vec3  FaceBitangent = vec3(0.0, 0.01, 0.0);
 
 #define OCEAN_VERTEX_ITERATIONS     24
 #define OCEAN_NORMAL_ITERATIONS     48
-#define OCEAN_GEOM_COORD_SCALE      48.0
+#define OCEAN_GEOM_COORD_SCALE      96.0
 #define OCEAN_NORMAL_COORD_SCALE    20.0
-#define OCEAN_DISPLACEMENT_KM       0.0250
+#define OCEAN_DISPLACEMENT_KM       0.014
 #define OCEAN_HEIGHT_CENTER         0.500
 #define OCEAN_NORMAL_STRENGTH       1.00
 #define OCEAN_NORMAL_EPS_KM         0.0030
