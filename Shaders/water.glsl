@@ -562,6 +562,7 @@ void main()
 
 	    // Rings and eclipse shadows
         vec3 ShadowColor = vec3(1.0);
+        vec3 eclFactor   = vec3(1.0);   // eclipse tint only, never RingsShadow
 
 	    #if (SHADOW && !defined(PLANEMO) && defined(BLOODMOON))
 
@@ -587,7 +588,8 @@ void main()
             #ifdef ECL
 				float lightAngularRadius = asin(clamp(LightParams[i].x * invLightDist, 0.0, 1.0));
                 vec3 eclColor = EclipseShadowColoredAuto(i, MAX_ECLIPSES, FragPosS, lightPosEll * invLightDist, lightAngularRadius);
-                ShadowColor *= mix(vec3(1.0), eclColor, AmbientColor.a);
+                eclFactor = mix(vec3(1.0), eclColor, AmbientColor.a);
+                ShadowColor *= eclFactor;
                 float eclipse = 1.0 - clamp(dot(eclColor, vec3(0.33333)), 0.0, 1.0);
                 eclipse *= step(0.0, dot(lightPosEll, FragPosS));
                 EclipseMask *= 1.0 - eclipse;
@@ -615,7 +617,8 @@ void main()
             #ifdef ECL
 				float lightAngularRadius = asin(clamp(LightParams[i].x * invLightDist, 0.0, 1.0));
                 float eclipse = EclipseShadowFar(i, MAX_ECLIPSES, FragPosS, lightPosEll * invLightDist, lightAngularRadius);
-                ShadowColor *= 1.0 - AmbientColor.a * eclipse;
+                eclFactor = vec3(1.0 - AmbientColor.a * eclipse);
+                ShadowColor *= eclFactor;
                 eclipse *= step(0.0, dot(lightPosEll, FragPosS));
                 EclipseMask *= 1.0 - eclipse;
             #endif
@@ -656,7 +659,6 @@ void main()
                 Inscatter += inscatterGround(lightVec) * sunLight;
         #endif
     
-	
 	// Atmospheric Ringshine Illumination & Atmospheric Ground Inscattering
         // Concept & Inscattering: Donatelo200
         // Multi-Band Integral & Analytical Shadow Cylinder (shadow_occ): JustNoetic
@@ -722,7 +724,7 @@ void main()
             const int NUM_BANDS = 8;
             vec3 accum_band_light = vec3(0.0);
             
-            vec3 ringLightColor = LightColor[i].rgb * ShadowColor;
+            vec3 ringLightColor = LightColor[i].rgb * eclFactor;
             
             for (int band = 0; band < NUM_BANDS; band++) {
                 float u = (float(band) + 0.5) / float(NUM_BANDS);
