@@ -670,17 +670,18 @@ void main()
             float frag_elev = dot(Normal, poleVec);
             float sun_elev  = dot(sunDir, poleVec);
 
-            float planet_radius_m = max(1.0, EyePosLocal.w);
+
+            float planet_radius_m = Radiuses.w;
             float ring_inner_pr = (RingsParams.x / planet_radius_m);
             float ring_outer_pr = ((RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m);
-			//float ring_outer_vis = ((1.5575/(1.5575 - tan(1/ring_outer_pr)))-1)/2+1;
-			float ring_outer_vis = pow((pi/2)/acos(1/ring_outer_pr),0.5);
+			float ring_outer_vis = pow((pi/2)/acos(1/ring_outer_pr),1);
 			float in_out_ratio = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w)))/ RingsParams.x;
 			
 			
-			float sin_lat = abs(frag_elev)*ring_outer_vis;
-            float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat));
-            float lat_decay = pow(cos_lat, 1.57 + in_out_ratio);
+			float sin_lat = abs(frag_elev);
+            float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat*ring_outer_vis));
+            //float lat_decay = pow(cos_lat, 1);
+			float lat_decay = pow(cos_lat, 1.57+in_out_ratio);
             float form_factor = sin_lat * lat_decay * 5;
 			
 			//float ring_inner_pr = RingsParams.x / planet_radius_m;
@@ -706,12 +707,27 @@ void main()
 
             // Vector pointing from atmosphere/ground fragment toward ring system in sky
             float sign_lat = (frag_elev >= 0.0) ? 1.0 : -1.0;
-            vec3 ringLightDir = normalize(Normal * cos_lat - poleVec * (sign_lat * sin_lat));
-
-            float equinox_fade = smoothstep(0.0001, 0.001745, abs(sun_elev));
-            float physical_sun_elev = eff_sun_elev * equinox_fade;
+            
+/*			
+          // Calculate equatorial projections to create a longitudinal midnight line
+            vec3 eqNormalRaw = Normal - poleVec * frag_elev;
+            vec3 eqSunDirRaw = sunDir - poleVec * sun_elev;
+            
+            // Use max() to prevent division by zero (NaN black pixels) exactly at the poles
+            float eqNdotLS = dot(eqNormalRaw, eqSunDirRaw) / max(1e-5, length(eqNormalRaw) * length(eqSunDirRaw));
 
             float shadow_occ = 1.0;
+            if (eqNdotLS < 0.0) {
+                // night_depth: 0.0 at terminator -> 1.0 at true midnight meridian (North-South line)
+                float night_depth = max(0.0, -eqNdotLS);
+                // Exponent 1.4 + 95% max darkening creates a deep, unmistakably visible shadow with an 5% soft floor
+                float dark_curve = pow(night_depth, 1.4);
+                shadow_occ = 1.0 - dark_curve * 1.0;
+            }
+*/
+
+			
+			float shadow_occ = 1.0;
             if (NdotLS < 0.0) {
                 // night_depth: 0.0 at terminator -> 1.0 at true midnight
                 float night_depth = max(0.0, -NdotLS);
@@ -719,6 +735,13 @@ void main()
                 float dark_curve = pow(night_depth, 1.4);
                 shadow_occ = 1.0 - dark_curve * 0.95;
             }
+			
+			vec3 ringLightDir = normalize(Normal * 1.0 - poleVec * (sign_lat * sin_lat * ring_outer_vis));
+
+            float equinox_fade = smoothstep(0.0001, 0.001745, abs(sun_elev));
+   			float physical_sun_elev = eff_sun_elev * equinox_fade * shadow_occ;
+
+  
 
             // Accumulate light across all 8 ring bands inside single loop
             const int NUM_BANDS = 8;
@@ -740,7 +763,7 @@ void main()
             }
 
             // Total ring light flux hitting the ground/atmosphere
-            vec3 total_ring_light = accum_band_light * shadow_occ;
+            vec3 total_ring_light = accum_band_light;
 
             // Ground surface terrain & sea diffuse illumination from ringshine
             vec3 ringshine_surf = total_ring_light;
@@ -755,7 +778,7 @@ void main()
                 float savedEyeMuS = EyeMuS;
                 float savedMieHorFade = MieHorFade;
 
-                EyeMuS = clamp(dot(normalize(EyePosM), ringLightDir), 0.05, 1.0);
+                EyeMuS = clamp(dot(normalize(EyePosM), ringLightDir), -1.0, 1.0);
                 MieHorFade = smoothstep(0.0, AtmoParams2.y, EyeMuS);
 
                 if (atmoHorFix)
