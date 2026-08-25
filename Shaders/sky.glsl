@@ -280,18 +280,19 @@ void main()
             float frag_elev = Normal.y;
             float sun_elev  = sunDir.y;
 
-            float planet_radius_m = max(0.0, Radiuses.y - Radiuses.z*3.14);
+            float planet_radius_m = max(0.0, Radiuses.x - Radiuses.z);
             float ring_inner_pr = (RingsParams.x / planet_radius_m);
             float ring_outer_pr = ((RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m);
 			//float ring_outer_vis = ((1.5575/(1.5575 - tan(1/ring_outer_pr)))-1)/2+1;
-			float ring_outer_vis = pow((pi/2)/acos(1/ring_outer_pr),0.5);
+			float ring_outer_vis = (pi/2)/acos(1/ring_outer_pr);
 			float in_out_ratio = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w)))/ RingsParams.x;
 			
 			
-			float sin_lat = abs(frag_elev)*ring_outer_vis;
+			float sin_lat = abs(frag_elev);
             float cos_lat = sqrt(max(0, 1.0 - sin_lat * sin_lat));
+            //float lat_decay = pow(cos_lat, 1);
             float lat_decay = pow(cos_lat, 1.57 + in_out_ratio);
-            float form_factor = sin_lat * lat_decay * 5;
+			float form_factor = sin_lat * lat_decay * 5;
 			
 			//float ring_inner_pr = RingsParams.x / planet_radius_m;
             //float ring_outer_pr = (RingsParams.x + (1.0 / max(1e-6, RingsParams.w))) / planet_radius_m;
@@ -310,29 +311,53 @@ void main()
             float hemi_blend = smoothstep(-0.02, 0.02, same_hemi);
             float side_factor = mix(unlit_factor, lit_factor, hemi_blend);
 
-            // Vector pointing from atmosphere fragment toward ring system in sky
-            float sign_lat = (Normal.y >= 0.0) ? 1.0 : -1.0;
-            vec3 ringLightDir = normalize(Normal * cos_lat - vec3(0.0, sign_lat * sin_lat, 0.0));
-
-            float equinox_fade = smoothstep(0.0001, 0.001745, abs(sun_elev));
-            float physical_sun_elev = eff_sun_elev * equinox_fade;
-
+ /*
+ // Calculate equatorial projections to create a longitudinal midnight line
+            vec3 eqNormalRaw = vec3(Normal.x, 0.0, Normal.z);
+            vec3 eqSunDirRaw = vec3(sunDir.x, 0.0, sunDir.z);
+            
+            // Use max() to prevent division by zero (NaN black pixels) exactly at the poles
+            float eqNdotLS = dot(eqNormalRaw, eqSunDirRaw) / max(1e-5, length(eqNormalRaw) * length(eqSunDirRaw));
+			float Ang = 1/max(1.0,abs(sun_elev * ring_outer_vis));
             float shadow_occ = 1.0;
+            if (eqNdotLS < 0.0) {
+                // night_depth: 0.0 at terminator -> 1.0 at true midnight meridian (North-South line)
+                float night_depth = max(0.0, -eqNdotLS);
+                // Exponent 1.4 + 95% max darkening creates a deep, unmistakably visible shadow with an 5% soft floor
+                float dark_curve = pow(night_depth, 1.4);
+                shadow_occ = 1.0 - dark_curve * Ang;
+            }
+ */
+ 
+            
+			// Midnight darkening
+			float shadow_occ = 1.0;
             float NdotLS = dot(Normal, sunDir);
             if (NdotLS < 0.0) {
                 // night_depth: 0.0 at terminator -> 1.0 at true midnight
                 float night_depth = max(0.0, -NdotLS);
                 // Exponent 1.4 + 95% max darkening creates a deep, unmistakably visible shadow with an 5% soft floor
                 float dark_curve = pow(night_depth, 1.4);
-                shadow_occ = 1.0 - dark_curve * 0.95;
+                shadow_occ =  1 - dark_curve * 0.95;
             }
+			
+			
+			
+			// Vector pointing from atmosphere fragment toward ring system in sky
+            float sign_lat = (Normal.y >= 0.0) ? 1.0 : -1.0;
+            vec3 ringLightDir = normalize(Normal * 1.0 - vec3(0.0, sign_lat * sin_lat * ring_outer_vis, 0.0));
+
+            float equinox_fade = smoothstep(0.0001, 0.001745, abs(sun_elev));
+            float physical_sun_elev = eff_sun_elev * equinox_fade * shadow_occ;
+
+
 
             // Save state for inscatterSky override
             float savedEyeMuS = EyeMuS;
             float savedMieHorFade = MieHorFade;
 
             // Set state for ring light scattering based on ring's elevation in sky relative to camera
-            EyeMuS = clamp(dot(normalize(EyePosM), ringLightDir), 0.05, 1.0);
+            EyeMuS = clamp(dot(normalize(EyePosM), ringLightDir), -1.0, 1.0);
             MieHorFade = smoothstep(0.0, AtmoParams2.y, EyeMuS);
 
             // Accumulate light across all 8 ring bands inside single loop
@@ -353,7 +378,7 @@ void main()
             }
 
             // Radiative transfer modulated by shadow
-            vec3 total_ring_light = accum_band_light * shadow_occ;
+            vec3 total_ring_light = accum_band_light;
 
             Inscatter += inscatterSky(ringLightDir) * total_ring_light;
 
