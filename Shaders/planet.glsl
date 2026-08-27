@@ -1096,6 +1096,7 @@ void main()
         {
             vec3  sunDir = lightVec;
             vec3  poleVec = (SurfParams3.x == 0.0) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+			vec3 poleVecEcl = vec3(0.0, 1.0, 0.0);
             float frag_elev = dot(Normal, poleVec);
             float sun_elev  = dot(sunDir, poleVec);
 
@@ -1165,26 +1166,68 @@ void main()
 			float physical_sun_elev = eff_sun_elev * equinox_fade * shadow_occ;
 
 
+//Ring Eclipse
+float ring_inner_m = RingsParams.x;
+float ring_outer_m = RingsParams.x + (1.0 / max(1e-6, RingsParams.w));
 
-            // Accumulate light across all 8 ring bands inside single loop
-            const int NUM_BANDS = 8;
-            vec3 accum_band_light = vec3(0.0);
-            vec3 ringLightColor = LightColor[i].rgb * eclFactor;
-            for (int band = 0; band < NUM_BANDS; band++) {
-                float u = (float(band) + 0.5) / float(NUM_BANDS);
-                vec4 ring_sample = textureLod(RingsMap, vec2(u, 0.5), 0.0);
+vec3 sun_ring_proj = sunDir - poleVec * dot(sunDir, poleVec);
+float sun_ring_len = length(sun_ring_proj);
+vec3 dir_sun_ring = (sun_ring_len > 1e-4) ? (sun_ring_proj / sun_ring_len) : ((poleVec.y > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(1.0, 0.0, 0.0));
+vec3 dir_side_ring = cross(poleVec, dir_sun_ring);
 
-                float r_band = mix(ring_inner_pr, ring_outer_pr, u);
-                float band_area = (2.0 * r_band * (ring_outer_pr - ring_inner_pr) / float(NUM_BANDS));
-                float dist_sq = r_band * r_band + dist_to_center_pr * dist_to_center_pr;
-                float w = (band_area / max(1e-6, dist_sq)) * 0.1;
 
-                float band_brightness = physical_sun_elev * form_factor * w * RingsParams.z * side_factor;
-                accum_band_light += ring_sample.rgb * ring_sample.a * ringLightColor * band_brightness;
-            }
+#ifdef ECL
+    vec3 global_illum_fraction = vec3(0.0);
+    float total_weight = 0.0;
+    
+    const int NUM_SHADOW_SAMPLES = 64;     // More than 64 is bad performance for no gain
+    const float GOLDEN_ANGLE = 2.39996323; 
+    
+    for (int s = 0; s < NUM_SHADOW_SAMPLES; s++) {
+        // Distribute samples evenly across the ring area using a golden spiral
+        float r_frac = sqrt((float(s) + 0.5) / float(NUM_SHADOW_SAMPLES));
+        float r_sample_m = mix(ring_inner_m, ring_outer_m, r_frac);
+        float angle = float(s) * GOLDEN_ANGLE;
+        
+        vec3 dir_sample = cos(angle) * dir_sun_ring + sin(angle) * dir_side_ring;
+        vec3 P_sample = dir_sample * r_sample_m;
+        
+        vec3 ecl_sample = mix(vec3(1.0), EclipseShadowColoredAuto(i, MAX_ECLIPSES, P_sample, sunDir, star_ang_radius), AmbientColor.a);
+        
+        // Smooth things out
+        float sample_dot = dot(Normal, dir_sample);
+        float weight = max(0.001, smoothstep(0.0, 0.5, sample_dot));
+        
+        global_illum_fraction += ecl_sample * weight;
+        total_weight += weight;
+    }
+    global_illum_fraction /= max(1e-6, total_weight);
+#else
+    vec3 global_illum_fraction = vec3(1.0);
+#endif
 
-            // Total ring light flux hitting the ground/atmosphere
-            vec3 total_ring_light = accum_band_light;
+// 2. Accumulate light across all 8 ring texture bands
+const int NUM_BANDS = 8;
+vec3 accum_band_light = vec3(0.0);
+vec3 ringLightColor = LightColor[i].rgb;
+
+for (int band = 0; band < NUM_BANDS; band++) {
+    float u = (float(band) + 0.5) / float(NUM_BANDS);
+    vec4 ring_sample = textureLod(RingsMap, vec2(u, 0.5), 0.0);
+
+    float r_band_pr = mix(ring_inner_pr, ring_outer_pr, u);
+    float band_area = (2.0 * r_band_pr * (ring_outer_pr - ring_inner_pr) / float(NUM_BANDS));
+    float dist_sq = r_band_pr * r_band_pr + dist_to_center_pr * dist_to_center_pr;
+    float w = (band_area / max(1e-6, dist_sq)) * 0.1;
+
+    float band_brightness = physical_sun_elev * form_factor * w * RingsParams.z * side_factor;
+    
+    // Apply the smoothly integrated global mask
+    accum_band_light += ring_sample.rgb * ring_sample.a * ringLightColor * band_brightness * global_illum_fraction;
+}
+
+// Total ring light flux hitting the ground/atmosphere
+vec3 total_ring_light = accum_band_light;
 
             // Ground surface terrain & sea diffuse illumination from ringshine
             vec3 ringshine_surf = total_ring_light;
