@@ -659,8 +659,8 @@ void main()
                 Inscatter += inscatterGround(lightVec) * sunLight;
         #endif
     
-	// Atmospheric Ringshine Illumination & Atmospheric Ground Inscattering
-        // Concept & Inscattering: Donatelo200
+        // Atmospheric Ringshine Illumination
+        // Concept, Sky Inscattering & Analytical Eclipses and Planet Shadow: Donatelo200
         // Multi-Band Integral & Analytical Shadow Cylinder (shadow_occ): JustNoetic
 	#ifdef RINGSHINE
         #ifdef RINGS
@@ -708,47 +708,85 @@ void main()
             // Vector pointing from atmosphere/ground fragment toward ring system in sky
             float sign_lat = (frag_elev >= 0.0) ? 1.0 : -1.0;
             
-/*			
-          // Calculate equatorial projections to create a longitudinal midnight line
-            vec3 eqNormalRaw = Normal - poleVec * frag_elev;
-            vec3 eqSunDirRaw = sunDir - poleVec * sun_elev;
-            
-            // Use max() to prevent division by zero (NaN black pixels) exactly at the poles
-            float eqNdotLS = dot(eqNormalRaw, eqSunDirRaw) / max(1e-5, length(eqNormalRaw) * length(eqSunDirRaw));
-
-            float shadow_occ = 1.0;
-            if (eqNdotLS < 0.0) {
-                // night_depth: 0.0 at terminator -> 1.0 at true midnight meridian (North-South line)
-                float night_depth = max(0.0, -eqNdotLS);
-                // Exponent 1.4 + 95% max darkening creates a deep, unmistakably visible shadow with an 5% soft floor
-                float dark_curve = pow(night_depth, 1.4);
-                shadow_occ = 1.0 - dark_curve * 1.0;
-            }
-*/
-
-			
-			float shadow_occ = 1.0;
-            if (NdotLS < 0.0) {
-                // night_depth: 0.0 at terminator -> 1.0 at true midnight
-                float night_depth = max(0.0, -NdotLS);
-                // Exponent 1.4 + 95% max darkening creates a deep, unmistakably visible shadow with an 5% soft floor
-                float dark_curve = pow(night_depth, 1.4);
-                shadow_occ = 1.0 - dark_curve * 0.95;
-            }
 			
 			vec3 ringLightDir = normalize(Normal * 1.0 - poleVec * (sign_lat * sin_lat * ring_outer_vis));
 
             float equinox_fade = smoothstep(0.0001, 0.001745, abs(sun_elev));
-   			float physical_sun_elev = eff_sun_elev * equinox_fade * shadow_occ;
+   			float physical_sun_elev = eff_sun_elev * equinox_fade;
 
   
 
-            // Accumulate light across all 8 ring bands inside single loop
-            const int NUM_BANDS = 8;
+// Global Ring Eclipse Sampling across X quadrants around the rings
+            float ring_inner_m = RingsParams.x;
+            float ring_outer_m = RingsParams.x + (1.0 / max(1e-6, RingsParams.w));
+
+            vec3 sun_ring_proj = sunDir - poleVec * dot(sunDir, poleVec);
+            float sun_ring_len = length(sun_ring_proj);
+            vec3 dir_sun_ring = (sun_ring_len > 1e-4) ? (sun_ring_proj / sun_ring_len) : ((poleVec.y > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(1.0, 0.0, 0.0));
+            vec3 dir_side_ring = cross(poleVec, dir_sun_ring);
+
+            //const int NUM_BANDS = 8;
+            //const int NUM_SECTORS = 8; 
+            const float PI_2 = 6.28318530718;
+
             vec3 accum_band_light = vec3(0.0);
-            
-            vec3 ringLightColor = LightColor[i].rgb * eclFactor;
-            
+            vec3 ringLightColor = LightColor[i].rgb; // * eclFactor;
+
+
+vec3 ring_illum_fraction = vec3(0.0);
+float total_weight = 0.0;
+
+// Sample at the middle of the rings to approximate the shadow
+float r_mid_m = (ring_inner_m + ring_outer_m) * 0.58;   // 0.58 comes from SE weirdness lol.  Normally it should just be 0.5
+
+
+// Horizon angle for rings (Shadows and such)
+float r_pr = max(1.0001, r_mid_m / planet_radius_m);
+float horizon_cos = 1.0 / r_pr;
+
+for (int s = 0; s < NUM_SECTORS; s++) {
+    float angle = float(s) * (PI_2 / float(NUM_SECTORS));
+    
+    // Calculate direction and point for this specific quadrant
+    vec3 dir_sector = cos(angle) * dir_sun_ring + sin(angle) * dir_side_ring;
+    vec3 P_sector = dir_sector * r_mid_m;
+
+    // Planet shadow
+    float p_dot_sun = dot(P_sector, sunDir);
+    float planet_shadow = 1.0;
+    
+    if (p_dot_sun < 0.0) {
+        float dist_to_center_sq = dot(P_sector, P_sector) - (p_dot_sun * p_dot_sun);
+        float dist_to_center = sqrt(max(0.0, dist_to_center_sq));
+        
+        // Approximate penumbra width based on sun angular radius
+        float penumbra = max(1e-4, -p_dot_sun * star_ang_radius); 
+        
+        // Soft shadow intersection
+        planet_shadow = smoothstep(planet_radius_m - penumbra, planet_radius_m + penumbra, dist_to_center);
+    }
+
+    vec3 sector_illum = vec3(planet_shadow);
+
+    // Eclipses from other moons/planets
+    #ifdef ECL
+	if (planet_shadow > 0.001) {
+        vec3 ecl_sector = mix(vec3(1.0), EclipseShadowColoredAuto(i, MAX_ECLIPSES, P_sector, sunDir, star_ang_radius), AmbientColor.a);
+        sector_illum *= ecl_sector;
+		}
+    #endif
+    
+    // Weigh each section and smooth out seams
+    float sector_dot = dot(Normal, dir_sector);
+    float weight = max(0.0000001, smoothstep(horizon_cos, 1.0, sector_dot));
+    ring_illum_fraction += sector_illum * weight;
+    total_weight += weight;
+}
+
+// Normalize the final accumulated illumination
+ring_illum_fraction /= max(1.0, total_weight);
+
+            // Accumulate light across the 8 ring bands
             for (int band = 0; band < NUM_BANDS; band++) {
                 float u = (float(band) + 0.5) / float(NUM_BANDS);
                 vec4 ring_sample = textureLod(RingsMap, vec2(u, 0.5), 0.0);
@@ -759,7 +797,9 @@ void main()
                 float w = (band_area / max(1e-6, dist_sq)) * 0.1;
 
                 float band_brightness = physical_sun_elev * form_factor * w * RingsParams.z * side_factor;
-                accum_band_light += ring_sample.rgb * ring_sample.a * ringLightColor * band_brightness;
+                
+                // Apply the pre-calculated global ring shadow to each band
+                accum_band_light += ring_sample.rgb * ring_sample.a * ringLightColor * band_brightness * ring_illum_fraction;
             }
 
             // Total ring light flux hitting the ground/atmosphere
