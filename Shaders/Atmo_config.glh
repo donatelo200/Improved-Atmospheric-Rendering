@@ -1,2 +1,7 @@
-const float Ring_Shine = 0;
-//not used yet
+//Config for Improve atmospheric rendering
+
+// Ringshine Quality settings
+#define NUM_BANDS  8		// Determins amount of loops for overall lighting.
+#define NUM_SECTORS  16		// Number of sections for Eclipses and midnight darkening.  I would reccomend keeping this below 64 as it will impact performance.
+
+

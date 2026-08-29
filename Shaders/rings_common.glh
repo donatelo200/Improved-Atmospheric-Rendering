@@ -1,4 +1,5 @@
 #ifdef _FRAGMENT_
+#include "Atmo_config.glh"
 //-----------------------------------------------------------------------------
 #ifdef USE_HIGH_PRECISION
 precision highp float;
@@ -20,6 +21,7 @@ precision highp float;
 //#define DUST_RINGS_DETAILED_NOISE_AZIMUTAL
 
 #define RINGSHINE
+
 
 //-----------------------------------------------------------------------------
 #ifdef RINGS_NOISE_CODE

@@ -7,6 +7,7 @@
 
 #define ECLIPSE_SHADOW_GAMMA         1.0/1.6
 #define ECLIPSE_SHADOW_GAMMA_RINGS3D 1.0/1.6
+#define BLOODMOON
 
 //-----------------------------------------------------------------------------
 
