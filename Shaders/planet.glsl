@@ -1139,74 +1139,75 @@ void main()
 			float physical_sun_elev = eff_sun_elev * equinox_fade ;
 
 
-// Global Ring Eclipse Sampling across X quadrants around the rings
+			// Eclipses and Mindight darkening -Donatelo200
             float ring_inner_m = RingsParams.x;
             float ring_outer_m = RingsParams.x + (1.0 / max(1e-6, RingsParams.w));
 
+	
+			vec3 accum_band_light = vec3(0.0);
+            vec3 ringLightColor = LightColor[i].rgb; // * eclFactor;
+
+            // Sample at the middle of the rings to approximate the shadow
+            float r_mid_m = (ring_inner_m + ring_outer_m) * 0.56;   //0.56 because of SE weirdness
+
+            // Ring-plane projection
             vec3 sun_ring_proj = sunDir - poleVec * dot(sunDir, poleVec);
             float sun_ring_len = length(sun_ring_proj);
             vec3 dir_sun_ring = (sun_ring_len > 1e-4) ? (sun_ring_proj / sun_ring_len) : ((poleVec.y > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(1.0, 0.0, 0.0));
-            vec3 dir_side_ring = cross(poleVec, dir_sun_ring);
 
-            //const int NUM_BANDS = 8;
-            //const int NUM_SECTORS = 8; 
-            const float PI_2 = 6.28318530718;
+            vec3 normalRingPlane = Normal - poleVec * frag_elev;
+            float normalRingPlaneLen = length(normalRingPlane);
+            vec3 dir_repr = (normalRingPlaneLen > 1e-4) ? (normalRingPlane / normalRingPlaneLen) : dir_sun_ring;
+            vec3 P_repr = dir_repr * r_mid_m;
 
-            vec3 accum_band_light = vec3(0.0);
-            vec3 ringLightColor = LightColor[i].rgb; // * eclFactor;
+            // Host planets shadow on rings
+            float r_pr = max(1.0001, r_mid_m / planet_radius_m);
+            float horizon_cos = 1.0 / r_pr;                              // = planet_radius_m / r_mid_m
 
+            // Roll shadows towards poles
+			float delta_visible = acos(clamp(horizon_cos / max(normalRingPlaneLen, 1e-4), -1.0, 1.0));
 
-vec3 ring_illum_fraction = vec3(0.0);
-float total_weight = 0.0;
+            float cos_beta = max(1e-4, sun_ring_len);                    // sun's elevation above ring plane (cosine)
+            float sin_beta = dot(sunDir, poleVec);
+            float delta_shadow = sqrt(max(0.0, horizon_cos*horizon_cos - sin_beta*sin_beta)) / cos_beta; // shadow half-angle, centered on -dir_sun_ring
 
-// Sample at the middle of the rings to approximate the shadow
-float r_mid_m = (ring_inner_m + ring_outer_m) * 0.58;   // 0.58 comes from SE weirdness lol.  Normally it should just be 0.5
+            float delta_repr = acos(clamp(-dot(dir_repr, dir_sun_ring), -1.0, 1.0)); // this fragment's angular distance from the antisolar ring point
 
-// Horizon angle for rings (Shadows and such)
-float r_pr = max(1.0001, r_mid_m / planet_radius_m);
-float horizon_cos = 1.0 / r_pr;
+            // Fraction of visible ring arc in shadow
+            float ov_b = max(delta_visible, 0.0);
+            float overlap = max(0.10, min(delta_repr + ov_b, delta_shadow) - max(delta_repr - ov_b, -delta_shadow));
+            float planet_shadow = max(1.0 - overlap / (2.0 * ov_b), 0.0);
 
-for (int s = 0; s < NUM_SECTORS; s++) {
-    float angle = float(s) * (PI_2 / float(NUM_SECTORS));
-    
-    // Calculate direction and point for this specific quadrant
-    vec3 dir_sector = cos(angle) * dir_sun_ring + sin(angle) * dir_side_ring;
-    vec3 P_sector = dir_sector * r_mid_m;
+            vec3 ring_illum_fraction = vec3(planet_shadow);
 
-    // Planet shadow
-    float p_dot_sun = dot(P_sector, sunDir);
-    float planet_shadow = 1.0;
-    
-    if (p_dot_sun < 0.0) {
-        // Sector is on the night side of the planet relative to the sun
-        float dist_to_center_sq = dot(P_sector, P_sector) - (p_dot_sun * p_dot_sun);
-        float dist_to_center = sqrt(max(0.0, dist_to_center_sq));
-        
-        // Approximate penumbra width based on sun angular radius
-        float penumbra = max(1e-4, -p_dot_sun * star_ang_radius); 
-        
-        planet_shadow = smoothstep(planet_radius_m - penumbra, planet_radius_m + penumbra, dist_to_center);
-    }
+            // Eclipse from other moons/planets
+              #ifdef ECL
+                vec3 dir_side_ring = cross(poleVec, dir_sun_ring);
+                const float PI_2 = 6.28318530718;
 
-    vec3 sector_illum = vec3(planet_shadow);
+                                  
+                float ecl_threshold_cos = cos(delta_visible);  // Visibility of rings
 
-    // Eclipses from other moons/planets
-    #ifdef ECL
-    if (planet_shadow > 0.001) {
-		vec3 ecl_sector = mix(vec3(1.0), EclipseShadowColoredAuto(i, MAX_ECLIPSES, P_sector, sunDir, star_ang_radius), AmbientColor.a);
-        sector_illum *= ecl_sector;
-		}
-    #endif
-    
-	// Weigh each section and smooth out seams
-    float sector_dot = dot(Normal, dir_sector);
-    float weight = max(0.0000001, smoothstep(horizon_cos, 1.0, sector_dot));
-    ring_illum_fraction += sector_illum * weight;
-    total_weight += weight;
-}
+                vec3 ecl_avg = vec3(0.0);
+                float ecl_weight_sum = 0.0;
 
-// Normalize the final accumulated illumination
-ring_illum_fraction /= max(1.0, total_weight);
+                for (int t = 0; t < NUM_SECTORS; t++) {
+                    float ang = float(t) * (PI_2 / float(NUM_SECTORS)); 
+                    vec3 dir_sector = cos(ang) * dir_sun_ring + sin(ang) * dir_side_ring;
+
+                    float sector_dot = dot(dir_repr, dir_sector);        
+                    float weight = max(0.0000001, smoothstep(ecl_threshold_cos, 1.0, sector_dot));
+
+                    if (weight > 0.0000001) {
+                        vec3 ecl_tap = EclipseShadowColoredAuto(i, MAX_ECLIPSES, dir_sector * r_mid_m, sunDir, star_ang_radius);
+                        ecl_avg += ecl_tap * weight;
+                        ecl_weight_sum += weight;
+                    }
+                }
+                ecl_avg = (ecl_weight_sum > 0.0000001) ? (ecl_avg / ecl_weight_sum) : vec3(1.0);
+
+                ring_illum_fraction *= mix(vec3(1.0), ecl_avg, AmbientColor.a);
+            #endif
 
             // Accumulate light across the 8 ring bands
             for (int band = 0; band < NUM_BANDS; band++) {
