@@ -1,0 +1,363 @@
+// The include file for SpaceEngine's planetary surface / sky shaders
+//
+// Exact optimisations of the per-light work, and the eclipse gates.
+//
+// Everything here gives the same picture as the original code. Each item skips
+// work whose result is provably multiplied by zero, or provably 1.0:
+//
+//   LOPT_GATE_GROUND_ECL     The eclipse function is evaluated for every light at
+//                            every pixel, even when no caster can possibly reach
+//                            the planet. A cheap test that uses uniforms only
+//                            (the same for the whole frame) skips it.
+//   LOPT_GATE_RINGSHINE_ECL  The ringshine code evaluates the eclipse function
+//                            for up to NUM_SECTORS ring sectors, per light, per
+//                            pixel, in every pass (terrain, clouds, ocean, sky).
+//                            Those taps do not depend on the pixel at all. The
+//                            same test skips them when no caster can reach the
+//                            ring circle (or when the ring circle is entirely in
+//                            the planet's shadow and the result is zeroed anyway).
+//   LOPT_SKIP_NIGHT_ATMO     irradiance() is multiplied by MieHorFade and the
+//                            inscatter by rayleighFade (or MieHorFade), which are
+//                            exactly 0 for a light that is well below the horizon
+//                            of the eye. The table lookups are skipped.
+//   LOPT_SKIP_NIGHT_BRDF     The Cook-Torrance BRDF is only ever multiplied by the
+//                            direct light, which is 0 when the light is below
+//                            the horizon of the fragment.
+//
+// Comment out LIGHT_OPT to get the original light loop back.
+
+#ifndef LIGHT_OPT_INCLUDED
+#define LIGHT_OPT_INCLUDED
+
+// LOPT_RINGSHINE_VERTEX has to be visible to BOTH shader stages: the vertex shader reads
+// it to know whether to do the ringshine eclipse-tap work, the fragment shader reads it to
+// know whether to use the vertex shader's result instead of doing that work itself. So it
+// sits here, outside the "#ifdef _FRAGMENT_" below -- everything else in this file is
+// fragment-only.
+//
+// The switch guarding the new vertex/fragment code in planet.glsl, water.glsl and sky.glsl
+// is "defined(RINGS) && defined(ECL) && (LOPT_RINGSHINE_VERTEX != 0)" -- NOT "RINGSHINE".
+// RINGSHINE is never passed on the compiler command line; it is #define'd inside
+// rings_common.glh, and that whole file is wrapped in "#ifdef _FRAGMENT_", so RINGSHINE
+// only ever exists in the fragment stage. A vertex-side "#ifdef RINGSHINE" is always false,
+// so the vertex shader would skip its "out vec3 fRingEclAvg[MAX_LIGHTS];" declaration while
+// the fragment shader (where RINGS implies RINGSHINE) still declared it as "in" -- a shader
+// link error ("not declared as input from previous stage"), which is exactly what happened
+// the first time this was tried. RINGS && ECL is the condition rings_common.glh itself is
+// included under, so it is equivalent in the fragment stage and, unlike RINGSHINE, is also
+// visible in the vertex stage.
+//
+// Ringshine's eclipse-sector loop (NUM_SECTORS taps, per light, per pixel, in every one
+// of the 4 render passes) does not depend on the fragment it runs at: only the WEIGHTS
+// given to the taps do. Moving the whole loop into the vertex shader, and interpolating
+// its result across each triangle the way normals and tangents already are, turns
+// "NUM_SECTORS taps x every pixel" into "NUM_SECTORS taps x every vertex" -- normally a
+// large win, since patches have far fewer vertices than pixels.
+//
+// UNVERIFIED: everything else in this file was checked against a numerical model of the
+// shadow maths; this switch changes which shader stage runs the code and how its result
+// reaches the pixel (an interpolated varying instead of a per-pixel computation), which
+// cannot be checked that way -- there is no way to compile or run real GLSL here. It is
+// off by default. Turn it on for one planet, compare it against 0 side by side, and check
+// that the shaders still compile (a new "out/in vec3 fRingEclAvg[MAX_LIGHTS];" varying is
+// added to planet.glsl, water.glsl and sky.glsl -- if the engine enforces a varying budget
+// this could in principle be exceeded, though MAX_LIGHTS*3 = 12 floats is normally small).
+#define LOPT_RINGSHINE_VERTEX   1
+
+#if (defined(RINGS) && defined(ECL) && (LOPT_RINGSHINE_VERTEX != 0))
+
+// NUM_SECTORS (and NUM_BANDS) are defined in Atmo_config.glh, which rings_common.glh only
+// includes inside "#ifdef _FRAGMENT_", so it doesn't reach the vertex shader on its own.
+// Including it again here, unconditionally, makes it reach both stages. If Atmo_config.glh
+// turns out not to tolerate being included twice (in the fragment stage, where
+// rings_common.glh already includes it), this is the first place to look.
+#include "Atmo_config.glh"
+
+// A copy of EclipseValue() / getCasterAtmoDensity() / EclipseShadowColoredAuto() from
+// eclipse_common.glh, for the vertex shader: that file wraps its entire content in
+// "#ifdef _FRAGMENT_", so none of it -- not even this function, which turns out to be
+// pure arithmetic with no texture reads and no derivatives, and so has no actual reason
+// to be fragment-only -- reaches the vertex shader. Copied rather than un-wrapped, so
+// eclipse_common.glh itself (not part of this round's files) is untouched. Kept
+// byte-for-byte identical to the original on purpose: if eclipse_common.glh's version
+// changes, this one needs to change with it, or the vertex and fragment shaders will
+// silently disagree on what an eclipse looks like.
+
+float   LoptEclipseValue(float lightAngularRadius, float casterAngularRadius, float angularDistance)
+{
+    float sumRadius = lightAngularRadius + casterAngularRadius;
+
+    if (angularDistance >= sumRadius) return 0.0;
+
+    float minRadius;
+    float maxPhase;
+    if (lightAngularRadius < casterAngularRadius)
+    {
+        minRadius = lightAngularRadius;
+        maxPhase = 1.0;
+    }
+    else
+    {
+        minRadius = casterAngularRadius;
+        if (lightAngularRadius < 0.001)
+            maxPhase = (casterAngularRadius * casterAngularRadius) / (lightAngularRadius * lightAngularRadius);
+        else
+            maxPhase = (1.0 - cos(casterAngularRadius)) / (1.0 - cos(lightAngularRadius));
+    }
+
+    if (angularDistance <= max(lightAngularRadius, casterAngularRadius) - minRadius) return maxPhase;
+
+    float Diff = abs(lightAngularRadius - casterAngularRadius);
+
+    return maxPhase * smoothstep(1.0, 0.0, clamp((angularDistance - Diff) / (sumRadius - Diff), 0.0, 1.0));
+}
+
+float LoptCasterAtmoDensity(float casterRadius)
+{
+    float R_km = (casterRadius > 100000.0) ? (casterRadius * 0.001) : casterRadius;
+
+    if (R_km < 2400.0) return 0.0;
+    if (R_km < 3000.0) return 1.2;
+    if (R_km < 4800.0) return 0.006;
+    if (R_km < 15000.0) return 1.0;
+    return 1.3;
+}
+
+vec3 LoptEclipseShadowColoredAuto(int lightIndex, int castersPerLight, vec3 FragPosS, vec3 lightVec, float lightAngularRadius)
+{
+    vec3 shadowColor = vec3(1.0);
+    float lightToCasterAngle;
+
+    for (int i = 0; i < castersPerLight; ++i)
+    {
+        float casterRadius = EclipseCasters[lightIndex * castersPerLight + i].w;
+        if (casterRadius <= 0.0) break;
+
+        vec3  casterPos = EclipseCasters[lightIndex * castersPerLight + i].xyz - FragPosS;
+        float casterInvDist = inversesqrt(dot(casterPos, casterPos));
+        float casterAngRadius = asin(clamp(casterRadius * casterInvDist, 0.0, 1.0));
+
+        vec3  casterVec = casterPos * casterInvDist;
+        float cosa = dot(lightVec, casterVec);
+
+        if (cosa < 0.95)
+            lightToCasterAngle = acos(clamp(cosa, 0.0, 1.0));
+        else
+            lightToCasterAngle = asin(clamp(length(cross(lightVec, casterVec)), 0.0, 1.0));
+
+        float penumbra_outer = lightAngularRadius + casterAngRadius;
+        float penumbra_inner = max(0.0, casterAngRadius - lightAngularRadius);
+
+        float eclipseVal = LoptEclipseValue(lightAngularRadius, casterAngRadius, lightToCasterAngle);
+        float occ = clamp(eclipseVal, 0.0, 1.0);
+
+        float geoShadow = pow(clamp(1.0 - occ, 0.0, 1.0), 1.0/1.6);
+        vec3 caster_shadow = vec3(geoShadow);
+
+        float atmo_density = LoptCasterAtmoDensity(casterRadius);
+
+        float max_bend = 0.0201 * atmo_density;
+
+        if (max_bend > 1e-6 && lightToCasterAngle < penumbra_outer)
+        {
+            float req_bend = casterAngRadius - lightToCasterAngle;
+
+            if (req_bend <= max_bend)
+            {
+                float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
+
+                float R_km = (casterRadius > 100000.0) ? (casterRadius * 0.001) : casterRadius;
+                vec3 atmo_ext_exp;
+
+                if (R_km >= 15000.0)
+                {
+                    atmo_ext_exp = vec3(18.0, 4.0, 2.0) * atmo_density;
+                }
+                else if (R_km < 3000.0 && R_km >= 2400.0)
+                {
+                    atmo_ext_exp = vec3(2.5, 12.0, 28.0) * atmo_density;
+                }
+                else
+                {
+                    atmo_ext_exp = vec3(3.5, 10.0, 22.0) * atmo_density;
+                }
+
+                vec3 atmo_transmittance = vec3(
+                    exp(-atmo_ext_exp.r * pow(atmo_depth, 1.5)),
+                    exp(-atmo_ext_exp.g * pow(atmo_depth, 1.5)),
+                    exp(-atmo_ext_exp.b * pow(atmo_depth, 1.5))
+                );
+
+                float caster_dist = 1.0 / max(1e-6, casterInvDist);
+                float focal_dist = casterRadius / max_bend;
+                float focal_ratio = caster_dist / max(1e-6, focal_dist);
+
+                float distance_divergence = min(1.0, (focal_dist * focal_dist) / max(1e-6, caster_dist * caster_dist));
+
+                float lens_amplification = clamp(1.0 / (abs(1.0 - focal_ratio) + 0.3), 0.5, 3.0);
+
+                float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, lightToCasterAngle);
+
+                float body_surface_fade = smoothstep(1.0, 0.8, atmo_depth);
+
+                float atmo_base_intensity = 0.00005;
+                float refraction_intensity = atmo_base_intensity * distance_divergence * lens_amplification * (1.0 - atmo_depth * 0.7) * body_surface_fade;
+
+                caster_shadow += atmo_transmittance * refraction_intensity * atmo_blend;
+            }
+        }
+
+        shadowColor *= clamp(caster_shadow, vec3(0.0), vec3(1.0));
+    }
+
+    return shadowColor;
+}
+
+#endif // RINGS && ECL && LOPT_RINGSHINE_VERTEX
+
+#ifdef _FRAGMENT_
+
+#define LIGHT_OPT
+
+#ifdef LIGHT_OPT
+    #define LOPT_GATE_GROUND_ECL
+    #define LOPT_GATE_RINGSHINE_ECL
+    #define LOPT_SKIP_NIGHT_ATMO
+    #define LOPT_SKIP_NIGHT_BRDF
+#endif
+
+//-----------------------------------------------------------------------------
+// Gates of the path integrated shadows (atmo_shadow.glh) and of the eclipse tests
+// above. A gate only ever decides "no shadow possible", it never invents one.
+//
+// 0 turns every gate off (all rays are sampled, the eclipse function is always
+// evaluated); the switches below turn one kind off on its own.
+
+#define ATMO_SHADOW_GATES       1
+#define ATMO_GATE_ECL           1       // uniform-only eclipse gate: can any caster reach the planet at all?
+#define ATMO_GATE_ECL_RAY       1       // per view ray eclipse gate (see atmo_shadow.glh)
+#define ATMO_GATE_RING          1       // ring gate
+
+#if (ATMO_SHADOW_GATES != 0 && ATMO_GATE_ECL != 0)
+    #define LOPT_ECL_GATE
+#endif
+
+// Stars that eclipse other stars are never gated: the eclipse function is not reliable
+// for them (huge distances, tiny angular sizes), so a gate cannot predict what it will
+// return, and skipping it removed shadows that the function does produce. A caster
+// counts as a star if it is bigger than LOPT_STAR_RADIUS km, or if it sits at the position
+// of another light.
+#define LOPT_STAR_RADIUS        100000.0
+
+//-----------------------------------------------------------------------------
+// Eclipse: can any caster of light li put a shadow, penumbra included, on any
+// point P with |P * scale| <= R?
+//
+// Uses uniforms only, so it is the same for every pixel of the frame. It is
+// conservative: the angular sizes are taken at their largest value inside the
+// bound and inflated by 30%, and it mirrors EclipseShadowColoredAuto(), which
+// clamps its separation angle to 90 degrees and therefore reports a shadow for
+// any caster when the two angular radii add up to more than that.
+
+#ifdef ECL
+
+// Is this caster (of light li) a star?
+bool    LoptCasterIsStar(vec4 cst, int li)
+{
+    if (cst.w >= LOPT_STAR_RADIUS) return true;
+
+    for (int k = 0; k < MAX_LIGHTS; k++)
+    {
+        if (k == li || LightParams[k].x <= 0.0) continue;
+        vec3 d = cst.xyz - LightPos[k];
+        if (dot(d, d) < 1.0e-6 * dot(LightPos[k], LightPos[k])) return true;     // same place: 0.1%
+    }
+    return false;
+}
+
+bool    LoptEclipseMayTouch(int li, vec3 scale, float R)
+{
+    const float SLACK = 1.3;
+
+    vec3  Lp  = LightPos[li] * scale;
+    float DL  = length(Lp);
+    vec3  L0  = Lp / DL;
+    float rl  = asin(clamp(SLACK * LightParams[li].x / max(DL - R, 1.0e-3), 0.0, 1.0));
+    float shL = asin(clamp(R / DL, 0.0, 1.0));
+
+    for (int j = 0; j < MAX_ECLIPSES; j++)
+    {
+        vec4 cst = EclipseCasters[li * MAX_ECLIPSES + j];
+        if (cst.w <= 0.0) break;
+
+        if (LoptCasterIsStar(cst, li)) return true;             // not gated, see above
+
+        float D0 = length(cst.xyz);
+        if (D0 <= R + SLACK * cst.w) return true;               // caster touches the bound
+
+        float rc  = asin(min(SLACK * cst.w / (D0 - R), 1.0));   // largest angular radius
+        float sep = acos(clamp(dot(L0, cst.xyz / D0), -1.0, 1.0));
+        float shC = asin(min(R / D0, 1.0));                     // caster direction shift inside the bound
+
+        if (min(sep - shC - shL, 1.5707963) < rl + rc) return true;
+    }
+    return false;
+}
+
+// Bound of every point a surface / atmosphere shader evaluates the eclipse at.
+// surfR = Radiuses.w * (1.0 + abs(SurfParams2.x)), the highest possible terrain.
+float   LoptBound(vec3 scale, float surfR)
+{
+    return max(Radiuses.y, surfR) * max(scale.x, max(scale.y, scale.z)) * 1.1 + 100.0;
+}
+
+// The eclipse at the fragment (or the water surface) of the current shader
+bool    LoptEclipseGround(int li, vec3 ellips, float surfR)
+{
+    #ifdef LOPT_ECL_GATE
+        return LoptEclipseMayTouch(li, ellips, LoptBound(ellips, surfR));
+    #else
+        return true;
+    #endif
+}
+
+// The eclipse taps of the ringshine code: unscaled points on a circle of radius rMid
+bool    LoptEclipseRings(int li, float rMid)
+{
+    #ifdef LOPT_ECL_GATE
+        return LoptEclipseMayTouch(li, vec3(1.0), rMid * 1.05 + 100.0);
+    #else
+        return true;
+    #endif
+}
+#endif // ECL
+
+//-----------------------------------------------------------------------------
+// Night: whether inscatter / sky irradiance can be anything but exactly zero for
+// the light that was just set up (EyeMuS and MieHorFade are set per light).
+
+#if (defined(ATMO) || defined(LOPT_ALWAYS_ATMO))
+
+// inscatterGround() / inscatterSky() end with rgb *= smoothstep(Angle, -Angle, EyeMuS)
+// (or, with HOR_FIX_ALL, rgb *= MieHorFade): zero for EyeMuS <= Angle (<= 0).
+bool    LoptHazeVisible()
+{
+    #ifdef HOR_FIX_ALL
+        return EyeMuS > 0.0;
+    #else
+        float ang = -acos(Radiuses.y / (Radiuses.y + Radiuses.z * 3.14));
+        return (Radiuses.z <= 1.0e-3) || (EyeMuS > ang);
+    #endif
+}
+
+// irradiance() returns texture(...) * MieHorFade
+bool    LoptSkyIrradVisible()
+{
+    return MieHorFade > 0.0;
+}
+
+#endif // ATMO
+
+#endif // _FRAGMENT_
+
+#endif // LIGHT_OPT_INCLUDED

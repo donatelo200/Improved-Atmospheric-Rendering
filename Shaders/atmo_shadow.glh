@@ -1,0 +1,817 @@
+// The include file for SpaceEngine's planetary surface / sky shaders
+//
+// Path-integrated eclipse and ring shadows for planets with atmospheres.
+//
+// The old code evaluated the shadow at ONE point (the ground fragment, or the
+// point where the view ray touches the top of the atmosphere) and multiplied the
+// whole inscattered light by it. Inscattered light actually comes from every
+// point along the view ray, and each of those points has its own shadow value.
+// A single-point shadow therefore:
+//   - cuts the atmosphere glow along a sharp line (ring shadow at the limb),
+//   - turns the sky into a black disc during a total eclipse, while the lit
+//     air near the horizon is what really makes the "360 degree twilight".
+//
+// Here the shadow is sampled along the view ray and averaged with the scattering
+// distribution of that ray: a segment scatters
+//     Tview(ray start -> segment) * (1 - Tsegment) * Tsun(densest point of segment)
+// of the light, per colour channel. The result is a per-channel "effective shadow"
+// that multiplies the ORIGINAL inscatterSky()/inscatterGround() result, so the
+// brightness, phase functions and colour grading of the atmosphere are untouched.
+// Without shadow the effective shadow is exactly 1.0 and nothing changes.
+//
+// PERFORMANCE: nearly all pixels of nearly all frames have no shadow anywhere
+// near their view ray, so the design is "reject early, sample as before".
+// Every shortcut is exact, or (the gates) provably conservative:
+//   1. Night: a light whose inscatter / sky irradiance is multiplied by an exact
+//      zero in the original code (light well below the horizon of the eye) is
+//      skipped altogether. See light_opt.glh.
+//   2. Eclipse gate: "can any caster's penumbra touch the atmosphere at all?"
+//      Uniform-only maths, the same for the whole frame.
+//   3. Ring gate: "can the ring plane crossing of this ray fall on the rings?"
+//      Analytic, no texture reads.
+//   4. Ring samples outside the ring extent do no texture fetches.
+//   5. When a gate lets a ray through it is shaded exactly like the ungated
+//      version (8 segments; fewer segments or boundary-sampled eclipses were
+//      measurably wrong).
+//   6. Safety net: a ray whose gates say "no shadow" is still sampled if the
+//      fragment it ends on is itself in shadow (the caller passes that shadow).
+//
+// Include after atmo_common.glh, rings_common.glh and eclipse_common.glh.
+
+#include "light_opt.glh"
+
+#ifdef _FRAGMENT_
+
+#if (defined(ECL) || defined(RINGS))
+
+// Comment this out to go back to the old single-point shadows
+#define ATMO_RAY_SHADOW
+
+#ifdef ATMO_RAY_SHADOW
+
+//-----------------------------------------------------------------------------
+// Settings
+
+// Ray segments along the view ray. 8 is a good balance.
+#define ATMO_SHADOW_STEPS       3
+
+// The segments are packed around the lowest point of the ray (where the air is thick), with a
+// square-root warp. That point is tLow = -dot(EyePos, viewDir): 0 for every ray above the
+// camera's LOCAL HORIZONTAL (the plane through the camera, perpendicular to the planet radius)
+// and growing about 90 km per degree below it. With a bare sqrt(tLow) the layout sat still above
+// that plane and swept quickly below it, which showed as a straight line across the sky, level
+// with the camera at any altitude, with curved arcs below it, in ring and eclipse shadows alike.
+// The warp is regularised by rayLen / ATMO_SHADOW_LAYOUT_DIV so its slope stays finite there.
+// Measured as the share of scenes with a jump across that plane that a dense reference does not
+// have (ring shadow): none 47%, 16: 9%, 32: 2%, 64: 6%, 256: 22%. 16 to 64 are all fine; very
+// large values bring the line back.
+#define ATMO_SHADOW_LAYOUT_DIV  16.0
+
+// The gate switches (ATMO_SHADOW_GATES, ATMO_GATE_ECL, ATMO_GATE_ECL_RAY,
+// ATMO_GATE_RING) are in light_opt.glh, because the eclipse gate is also used by
+// the original ringshine and ground eclipse code.
+
+// The fragment's own shadow, passed by the caller, overrides the gates: if the
+// fragment is in shadow the air above it is not skipped. 0 turns the net off.
+#define ATMO_GROUND_NET         1
+
+// Debug view. 1: every ray is shaded twice, with the gates and without them, and
+// where the two differ by more than 0.02 the haze is painted a flat colour:
+//   red    - the ECLIPSE gate rejected a ray that has an eclipse shadow
+//   green  - the RING gate rejected a ray that has a ring shadow
+//   yellow - both
+// (each colour is only shown if lifting that gate really changes the result)
+// Costs about three times a normal ray. Leave at 0 normally.
+#define ATMO_SHADOW_DEBUG       0
+
+// (internal) which gates are active
+#ifdef LOPT_ECL_GATE
+    #define ATMO_USE_ECL_GATE
+    #if (ATMO_GATE_ECL_RAY != 0)
+        #define ATMO_USE_ECL_RAY_GATE
+    #endif
+#endif
+#if (ATMO_SHADOW_GATES != 0 && ATMO_GATE_RING != 0)
+    #define ATMO_USE_RING_GATE
+#endif
+
+// 1: rays get one segment per ATMO_SHADOW_SEG_KM km (up to ATMO_SHADOW_STEPS)
+// instead of always ATMO_SHADOW_STEPS. Faster for terrain seen from the ground,
+// but the number of segments then depends on the ray length, which the terrain
+// shader jitters from tile to tile (heights, water). Off by default.
+#define ATMO_SHADOW_ADAPTIVE    0
+#define ATMO_SHADOW_SEG_KM      15.0
+
+// Sample points inside each segment, per ring source, when ATMO_ECL_CONE is off (see below).
+// The eclipse boundary is sharp, so it keeps 2 (fewer points make it wobble and "curl").
+#define ATMO_ECL_POINTS         2
+#define ATMO_RING_POINTS        4
+
+// Eclipse shadows are geometrically a pair of cones (umbra + penumbra) around the caster,
+// and EclipseShadowColoredAuto's transition across them is smooth (a smoothstep of angular
+// separation) -- unlike ring shadows, which have real texture detail and genuinely need
+// sampling. So instead of evaluating the eclipse at every segment tap (up to 16 times per
+// light), 1 evaluates it at 5 points along the ray and interpolates for the taps from those.
+//
+// Two things make that accurate, and an earlier version that had neither was not:
+//  - The 5 points sit on the same warped parameter the segments use, which is dense near the
+//    lowest point of the ray, where the air is thick and the scattering weight lives. Spaced
+//    evenly along the ray (as before) most of them land where almost nothing is scattered.
+//  - The interpolation is done on shadow^0.8, not on the shadow. Near an umbra the shadow
+//    grows like distance^1.25, so linear interpolation of the value overshoots badly -- and
+//    in a total eclipse the shadow along a horizon ray is only ~0.005, so a 2-3x overshoot is
+//    exactly the extra glow that showed up in-engine (the real light is a fraction of a percent).
+//
+// Measured against the full per-tap sampling and against a dense numerical reference, as a
+// RATIO (an absolute error of 0.02 is invisible at shadow 0.5 and 4x too bright at 0.005, which
+// is how the earlier version passed its checks): total eclipse, horizon rays, mean x1.17 vs
+// x1.10 for full sampling (the earlier version: x2.56). 5500 random rays with a visible
+// shadow: 99% within +-50% (earlier: 96%, with overshoots up to x19; full sampling: 99.9%).
+// 5 evaluations instead of up to 16. 0 samples every tap like before.
+// Set to 0 if an eclipse or twilight scene looks brighter than it should.
+#define ATMO_ECL_CONE           1
+
+// Exponent of the space the cone interpolates in (see above). The eclipse function returns
+// smoothstep(...)^ECLIPSE_SHADOW_GAMMA with a gamma of 1/1.6, so shadow^1.6 is the smoothstep
+// and its square root, shadow^0.8, is close to linear in distance. Only change this together
+// with ECLIPSE_SHADOW_GAMMA in eclipse_common.glh (POW = 0.5 / ECLIPSE_SHADOW_GAMMA).
+#define ATMO_ECL_CONE_POW       0.8
+
+// Layout divisor for the cone's 5 keys: like ATMO_SHADOW_LAYOUT_DIV but separate, because the
+// keys are more accurate the closer they stay to the unregularised placement (total eclipse,
+// horizon rays, 8 segments, how much too bright: 32 -> x1.32, 128 -> x1.26, 512 -> x1.20,
+// none -> x1.19), and with the segments regularised by ATMO_SHADOW_LAYOUT_DIV the keys showed no
+// seam across the camera's horizontal in 2000 umbra-edge scenes at 128 or 512.
+#define ATMO_ECL_CONE_LAYOUT_DIV  512.0
+
+// Ring opacity has to be averaged across the penumbra of the star, as OPACITY
+// (not density: the slant path power is non-linear).
+// ATMO_RING_STRAT = 0: ATMO_RING_TAPS mip filtered taps at every point. Exact, the
+//     same result as before the optimisation.
+// ATMO_RING_STRAT > 0: this many taps per ray sample point, at offsets that are
+//     different for every point of the ray (stratified), so the average over the
+//     whole ray still covers the penumbra. About half the fetches with 2, but
+//     the shadow along a ray can be off by a few percent (up to ~0.05).
+#define ATMO_RING_STRAT         0
+#define ATMO_RING_TAPS          4.0
+#define ATMO_SKY_SHARP          0       // 1: skylight shadow with one tap per height instead of ATMO_RING_TAPS (cheaper, slightly less exact)
+#define ATMO_RING_MAX_LOD       1.0     // mip level cap of each tap: keeps the taps sharp enough for the averaging to be unbiased
+
+// Multiple scattering "fill". The inscatter table already contains multiple
+// scattering, so it can't be separated and would be shadowed with the rest.
+// In reality it keeps the deepest shadow from being pitch black. Fraction of
+// the unshadowed inscatter / skylight that is always left.
+#define ATMO_SHADOW_FILL        0.0   // haze / sky glow
+#define ATMO_SKY_SHADOW_FILL    0.0   // skylight falling on the ground
+
+//-----------------------------------------------------------------------------
+// Rings
+
+#ifdef RINGS
+
+// Everything about the light and the ring frame that does not depend on the point
+struct AtmoRingCtx
+{
+    bool  zAxis;        // rings around the Z axis instead of Y
+    float ly;           // light direction along the ring axis
+    vec2  lp;           // light direction in the ring plane
+    vec2  ep;           // ellipsoid scale in the ring plane
+    float cosPhi;       // |ly|, sine of the light elevation over the ring plane
+    float invCosPhi;
+    float equinox;      // 0 when the light is in the ring plane
+    float texW;         // ring texture width
+};
+
+AtmoRingCtx AtmoRingsCtx(vec3 L, vec3 ellips, float axisZ)
+{
+    AtmoRingCtx c;
+    c.zAxis     = (axisZ != 0.0);
+    c.ly        = c.zAxis ? L.z : L.y;
+    c.lp        = c.zAxis ? L.xy : L.xz;
+    c.ep        = c.zAxis ? ellips.xy : ellips.xz;
+    c.cosPhi    = abs(c.ly);
+    c.invCosPhi = 1.0 / max(c.cosPhi, 0.333);
+    c.equinox   = smoothstep(0.001, 0.003, c.cosPhi);       // shadow disappears at equinox
+    c.texW      = float(textureSize(RingsMap, 0).x);
+    return c;
+}
+
+//-----------------------------------------------------------------------------
+// Ring shadow at an arbitrary point P (object space, km, planet centred).
+// Same maths as RingsShadow(), but without derivatives (fwidth/texture), so it
+// is safe inside loops and branches, and with a real penumbra: the shadow edge
+// is blurred by the angular size of the star times the distance from P to the
+// ring plane along the light ray.
+
+// (1 - density) ^ (1 / max(cosPhi, 1/3)): a plain cube when the light is lower than 19.5 degrees
+// over the ring plane, which is where the ring shadow is the most expensive
+float   AtmoSlantPow(float x, AtmoRingCtx c)
+{
+    return (c.cosPhi <= 0.333) ? x * x * x : pow(x, c.invCosPhi);
+}
+
+float   AtmoRingsShadowCtx(AtmoRingCtx c, vec3 P, float lightAngRad, float phase, bool sharp)
+{
+    if (c.equinox <= 0.0) return 1.0;
+
+    float py = c.zAxis ? P.z : P.y;
+    vec2  pp = c.zAxis ? P.xy : P.xz;
+
+    // Ring plane crossing along the light ray (only when the plane is between P and the light)
+    float tPlane = min(py / c.ly, 0.0);
+    vec2  proj   = (pp - c.lp * tPlane) * c.ep;
+    float texU   = (length(proj) - RingsParams.x) * RingsParams.w;
+
+    // Penumbra half width in texture units: star angular radius times distance to the ring plane
+    float blurKm = lightAngRad * abs(tPlane) / max(c.cosPhi, 0.15);
+    float blurU  = max(blurKm * RingsParams.w, 2.0e-5);
+
+    // Outside of the rings and their penumbra: no shadow and no texture reads
+    if (texU < -blurU || texU > 1.0 + blurU) return 1.0;
+
+    float opacity = 0.0;
+
+    if (blurU * c.texW < 0.5 || sharp)
+    {
+        // Penumbra narrower than a texel (or a sharp tap was asked for): one tap
+        float alpha   = textureLod(RingsMap, vec2(clamp(texU, 0.0, 1.0), 0.5), 0.0).a;
+        float density = clamp(RingsParams.z * alpha, 0.0, 1.0);
+        float inside  = step(0.0, texU) * step(texU, 1.0);
+        opacity = inside * (1.0 - AtmoSlantPow(1.0 - density, c));
+    }
+    else
+    {
+        #if (ATMO_RING_STRAT > 0)
+            // Stratified: a few sharp taps, offset by the phase of this sample point
+            for (int i = 0; i < ATMO_RING_STRAT; i++)
+            {
+                float f       = fract(phase + float(i) / float(ATMO_RING_STRAT));
+                float u       = texU + (f * 2.0 - 1.0) * blurU;
+                float alpha   = textureLod(RingsMap, vec2(clamp(u, 0.0, 1.0), 0.5), 0.0).a;
+                float density = clamp(RingsParams.z * alpha, 0.0, 1.0);
+                float inside  = step(0.0, u) * step(u, 1.0);
+                opacity += inside * (1.0 - AtmoSlantPow(1.0 - density, c));
+            }
+            opacity /= float(ATMO_RING_STRAT);
+        #else
+            // Average the slant-path ring opacity over the penumbra with a few mip-filtered taps
+            float lod = clamp(log2(max(2.0 * blurU / ATMO_RING_TAPS * c.texW, 1.0)), 0.0, ATMO_RING_MAX_LOD);
+
+            for (int i = 0; i < int(ATMO_RING_TAPS); i++)
+            {
+                float u       = texU + ((float(i) + 0.5) / ATMO_RING_TAPS * 2.0 - 1.0) * blurU;
+                float alpha   = textureLod(RingsMap, vec2(clamp(u, 0.0, 1.0), 0.5), lod).a;
+                float density = clamp(RingsParams.z * alpha, 0.0, 1.0);
+                float inside  = step(0.0, u) * step(u, 1.0);     // taps outside the rings cast no shadow: soft ring edges
+                opacity += inside * (1.0 - AtmoSlantPow(1.0 - density, c));
+            }
+            opacity /= ATMO_RING_TAPS;
+        #endif
+    }
+
+    return 1.0 - opacity * c.equinox;
+}
+
+float   AtmoRingsShadow(vec3 P, vec3 L, float lightAngRad, vec3 ellips, float axisZ)
+{
+    return AtmoRingsShadowCtx(AtmoRingsCtx(L, ellips, axisZ), P, lightAngRad, 0.5, false);
+}
+
+//-----------------------------------------------------------------------------
+// Can the ring shadow fall anywhere on the ray x0 + t * v, t = 0 .. rayLen?
+// Conservative and analytic: the ring plane crossing of the light ray moves
+// linearly along the view ray, so its distance from the planet axis is the
+// length of a linear vector function, and its range is known in closed form.
+
+bool    AtmoRingsRayMayShadow(AtmoRingCtx c, vec3 x0, vec3 v, float rayLen, float lightAngRad)
+{
+    if (c.equinox <= 0.0) return false;
+
+    float inner = RingsParams.x;
+    float outer = RingsParams.x + 1.0 / RingsParams.w;
+
+    // Rings reaching into the atmosphere itself: no shortcut
+    if (Radiuses.y * max(c.ep.x, c.ep.y) >= inner) return true;
+
+    float a = c.zAxis ? x0.z : x0.y;
+    float b = c.zAxis ? v.z  : v.y;
+    vec2  A = c.zAxis ? x0.xy : x0.xz;
+    vec2  B = c.zAxis ? v.xy  : v.xz;
+
+    // The ring plane is between the point and the light where h(t) < 0
+    float s  = sign(c.ly);
+    float h0 = a * s;
+    float hs = b * s;
+    float tlo = 0.0;
+    float thi = rayLen;
+
+    if (abs(hs) < 1.0e-9)
+    {
+        if (h0 >= 0.0) return false;
+    }
+    else
+    {
+        float tz = -h0 / hs;
+        if (hs > 0.0) thi = min(thi, tz);
+        else          tlo = max(tlo, tz);
+    }
+    if (tlo >= thi) return false;
+
+    // There, crossing(t) = C + D * t
+    vec2  C  = (A - c.lp * (a / c.ly)) * c.ep;
+    vec2  D  = (B - c.lp * (b / c.ly)) * c.ep;
+    float tm = clamp(-dot(C, D) / max(dot(D, D), 1.0e-12), tlo, thi);
+    float rMin = length(C + D * tm);
+    float rMax = max(length(C + D * tlo), length(C + D * thi));
+
+    // Penumbra widening (largest at the far end of the piece)
+    float g   = max(abs((a + b * tlo) / c.ly), abs((a + b * thi) / c.ly));
+    float pad = lightAngRad * g / max(c.cosPhi, 0.15) + 1.0;
+
+    return (rMax + pad >= inner) && (rMin - pad <= outer);
+}
+
+#endif // RINGS
+
+//-----------------------------------------------------------------------------
+// Eclipse
+
+#ifdef ECL
+
+// Can any caster of light li put a shadow, penumbra included, on any point of the
+// atmosphere? Uses uniforms only, so it is the same for every pixel of the frame.
+// Conservative: the atmosphere is bounded by a sphere, the angular sizes by their
+// largest value inside that sphere.
+
+bool    AtmoEclipseMayShadow(int li, vec3 ellips)
+{
+    return LoptEclipseMayTouch(li, ellips, LoptBound(ellips, Radiuses.w));
+}
+
+// Same question for one view ray x0 + t * v, t = 0 .. rayLen: can the penumbra of any
+// caster touch it? Conservative, checked at the middle of the ray with the caster
+// direction allowed to shift along the ray. Skips the pixels that are outside the
+// penumbra while an eclipse is going on.
+
+bool    AtmoEclipseRayMayShadow(int li, vec3 x0, vec3 v, float rayLen, vec3 LvecE, float lightAngRad, vec3 ellips)
+{
+    float halfLen = 0.5 * rayLen * max(ellips.x, max(ellips.y, ellips.z));
+    vec3  Pm      = (x0 + v * (0.5 * rayLen)) * ellips;
+
+    for (int j = 0; j < MAX_ECLIPSES; j++)
+    {
+        vec4 cst = EclipseCasters[li * MAX_ECLIPSES + j];
+        if (cst.w <= 0.0) break;
+
+        if (LoptCasterIsStar(cst, li)) return true;             // not gated (see light_opt.glh)
+
+        vec3  cp = cst.xyz - Pm;
+        float D  = length(cp);
+        if (D <= halfLen + cst.w) return true;
+
+        float rc  = asin(min(cst.w / (D - halfLen), 1.0));
+        float sep = acos(clamp(dot(LvecE, cp / D), -1.0, 1.0));
+        float shC = asin(min(halfLen / D, 1.0));
+
+        if (min(sep - shC, 1.5707963) < lightAngRad + rc) return true;      // (90 degree clamp, see above)
+    }
+    return false;
+}
+
+// Eclipse shadow colour at P, scaled by the eclipse shadow intensity setting
+vec3    AtmoEclipseAt(int li, vec3 P, vec3 LvecE, float lightAngRad, vec3 ellips)
+{
+    vec3 e = EclipseShadowColoredAuto(li, MAX_ECLIPSES, P * ellips, LvecE, lightAngRad);
+    return mix(vec3(1.0), e, AmbientColor.a);
+}
+
+//-----------------------------------------------------------------------------
+// Cone-shaped eclipse shadow: see ATMO_ECL_CONE above.
+
+#if (ATMO_ECL_CONE != 0)
+
+// Places the real eclipse evaluations and returns everything needed to interpolate them
+// cheaply for the rest of the ray. The middle point is always the ray's plain midpoint.
+//
+// An earlier version placed it at the caster's point of closest angular approach instead
+// (found from a quadratic fit through 3 cheap angle probes), which was measurably more
+// accurate on long grazing rays -- but that fit divides by the fitted curvature, which can
+// be arbitrarily close to zero, so the chosen point (and the shadow value that comes from
+// evaluating there) was NOT a continuous function of the view ray. Two adjacent pixels with
+// almost identical rays could end up with visibly different values, seen in-engine as a
+// sharp "cut" across the sky during a partial eclipse. Reproduced numerically: rays 0.02
+// degrees apart, off-axis from the umbra, differed by up to 0.007 in shadow fraction with
+// that version, against at most 0.0004 for plain per-tap sampling. The plain midpoint below
+// depends only on rayLen, so it cannot do this.
+// Written without arrays on purpose: GLSL array-typed function parameters have a history of
+// driver-specific compiler bugs (one real compile failure was already traced to this feature).
+// Each key is packed in a vec4: xyz = shadow^ATMO_ECL_CONE_POW, w = position along the ray, km.
+//
+// Key positions: equal steps of the same warped parameter AtmoShadowRayT() uses for the
+// segment boundaries, q = -sqrt(tLow) .. +sqrt(rayLen - tLow), t = tLow + sign(q) * q^2.
+// They depend on the ray geometry only through tLow and rayLen, both continuous, so adjacent
+// pixels get adjacent keys (a version that placed a key at the caster's closest approach was
+// not continuous and showed as a seam).
+void    AtmoEclipseConeKeys(int li, vec3 x0, vec3 v, float rayLen, vec3 LvecE, float lightAngRad, vec3 ellips,
+                             out vec4 k0, out vec4 k1, out vec4 k2, out vec4 k3, out vec4 k4)
+{
+    float tLow = clamp(-dot(x0, v), 0.0, rayLen);
+    float e0   = rayLen / ATMO_ECL_CONE_LAYOUT_DIV;    // see ATMO_ECL_CONE_LAYOUT_DIV
+    float qa   = sqrt(tLow + e0);
+    float qb   = sqrt(max(rayLen - tLow, 0.0) + e0);
+    float dq   = (qa + qb) * 0.25;
+
+    float t0 = clamp(tLow + sign(-qa)            * (-qa)            * (-qa),            0.0, rayLen);
+    float t1 = clamp(tLow + sign(-qa + dq)       * (-qa + dq)       * (-qa + dq),       0.0, rayLen);
+    float t2 = clamp(tLow + sign(-qa + dq * 2.0) * (-qa + dq * 2.0) * (-qa + dq * 2.0), 0.0, rayLen);
+    float t3 = clamp(tLow + sign(-qa + dq * 3.0) * (-qa + dq * 3.0) * (-qa + dq * 3.0), 0.0, rayLen);
+    float t4 = clamp(tLow + sign(-qa + dq * 4.0) * (-qa + dq * 4.0) * (-qa + dq * 4.0), 0.0, rayLen);
+
+    const vec3 e = vec3(ATMO_ECL_CONE_POW);
+    k0 = vec4(pow(max(AtmoEclipseAt(li, x0 + v * t0, LvecE, lightAngRad, ellips), vec3(0.0)), e), t0);
+    k1 = vec4(pow(max(AtmoEclipseAt(li, x0 + v * t1, LvecE, lightAngRad, ellips), vec3(0.0)), e), t1);
+    k2 = vec4(pow(max(AtmoEclipseAt(li, x0 + v * t2, LvecE, lightAngRad, ellips), vec3(0.0)), e), t2);
+    k3 = vec4(pow(max(AtmoEclipseAt(li, x0 + v * t3, LvecE, lightAngRad, ellips), vec3(0.0)), e), t3);
+    k4 = vec4(pow(max(AtmoEclipseAt(li, x0 + v * t4, LvecE, lightAngRad, ellips), vec3(0.0)), e), t4);
+}
+
+// Cheap lookup: linear interpolation of shadow^POW between the two keys around t, then back.
+vec3    AtmoEclipseConeLookup(vec4 k0, vec4 k1, vec4 k2, vec4 k3, vec4 k4, float t)
+{
+    vec4 a = k0;
+    vec4 b = k1;
+    if      (t > k3.w) { a = k3; b = k4; }
+    else if (t > k2.w) { a = k2; b = k3; }
+    else if (t > k1.w) { a = k1; b = k2; }
+
+    float span = max(b.w - a.w, 1.0e-6);
+    vec3  w    = mix(a.xyz, b.xyz, clamp((t - a.w) / span, 0.0, 1.0));
+    return pow(w, vec3(1.0 / ATMO_ECL_CONE_POW));
+}
+
+#endif // ATMO_ECL_CONE
+
+
+#endif // ECL
+
+//-----------------------------------------------------------------------------
+// Combined rings + eclipse shadow at an arbitrary point P (object space, km).
+// LvecE is the light direction and ellips the oblateness used by the eclipse code
+// (Ellipsoid in sky.glsl, EllipsGrav.xyz in planet.glsl and water.glsl).
+
+vec3    AtmoShadowAt(int li, vec3 P, vec3 Lvec, vec3 LvecE, float lightAngRad, vec3 ellips, float axisZ)
+{
+    vec3 s = vec3(1.0);
+
+    #ifdef RINGS
+        s *= AtmoRingsShadow(P, Lvec, lightAngRad, ellips, axisZ);
+    #endif
+
+    #ifdef ECL
+        s *= AtmoEclipseAt(li, P, LvecE, lightAngRad, ellips);
+    #endif
+
+    return s;
+}
+
+//-----------------------------------------------------------------------------
+// Transmittance of the atmosphere for the sunlight, zero inside the planet's shadow.
+// Same as transmittanceWithShadowDens(), but with an explicit texture level, so it
+// does not depend on screen space derivatives and is safe inside divergent branches.
+
+vec3    AtmoSunTransmittance(float sqrth, float mu, float mu0)
+{
+    if (mu < mu0) return vec3(0.0);
+    float uMu = atan(mu * 11.950355887 + 2.1510640597) * 0.6666666667;
+    return mix(vec3(1.0), textureLod(transmittanceSampler, vec2(uMu, sqrth), 0.0).rgb, AtmoParams1.x);
+}
+
+// Sunlight reaching the point P (radius r), zero inside the planet's shadow
+vec3    AtmoSunAt(vec3 P, float r, vec3 Lvec)
+{
+    float horMu = -sqrt(max(1.0 - (Radiuses.x * Radiuses.x) / (r * r), 0.0));
+    return AtmoSunTransmittance(sqrt(max(r - Radiuses.x, 0.0) / Radiuses.z), clamp(dot(P, Lvec) / r, -1.0, 1.0), horMu);
+}
+
+//-----------------------------------------------------------------------------
+// Ray parameter of the k-th segment boundary. The spacing is dense around the
+// lowest point of the ray (where the air is thickest) and coarse towards both
+// ends, whichever end of the ray that is: eye in space looking down, eye on the
+// ground looking up, or a grazing limb ray.
+
+float   AtmoShadowRayT(float k, float qa, float dq, float tLow, float rayLen)
+{
+    float q = -qa + k * dq;
+    return clamp(tLow + sign(q) * q * q, 0.0, rayLen);
+}
+
+//-----------------------------------------------------------------------------
+// Effective shadow of the light along the view ray x0 + t * v, t = 0 .. rayLen.
+// Multiply the result of inscatterSky() / inscatterGround() by it.
+//   x0     - ray start (EyePosM, on the top atmosphere boundary if the eye is in space)
+//   v      - unit view vector
+//   rayLen - length of the ray inside the atmosphere, km
+//   eclOn / ringOn - which shadow sources are sampled (the gates decide that)
+
+vec3    AtmoRayShadowCore(int li, vec3 x0, vec3 v, float rayLen,
+                          vec3 Lvec, vec3 LvecE, float lightAngRad, vec3 ellips, float axisZ,
+                          bool eclOn, bool ringOn)
+{
+    #ifdef RINGS
+        AtmoRingCtx ringCtx = AtmoRingsCtx(Lvec, ellips, axisZ);
+    #endif
+
+    if (!(eclOn || ringOn)) return vec3(1.0);
+
+    // Segment layout
+    #if (ATMO_SHADOW_ADAPTIVE != 0)
+        int nSeg = int(clamp(ceil(rayLen / ATMO_SHADOW_SEG_KM), 1.0, float(ATMO_SHADOW_STEPS)));
+    #else
+        int nSeg = ATMO_SHADOW_STEPS;
+    #endif
+
+    float tLow = clamp(-dot(x0, v), 0.0, rayLen);       // closest approach to the planet centre
+    float e0   = rayLen / ATMO_SHADOW_LAYOUT_DIV;       // keeps the layout smooth across the local horizontal
+    float qa   = sqrt(tLow + e0);
+    float qb   = sqrt(max(rayLen - tLow, 0.0) + e0);
+    float dq   = (qa + qb) / float(nSeg);
+
+    // Pass 1: shadow of every segment, the average of a few taps inside it
+    #if (ATMO_ECL_CONE != 0)
+        vec4  eclK0 = vec4(1.0, 1.0, 1.0, 0.0);
+        vec4  eclK1 = vec4(1.0, 1.0, 1.0, 0.25 * rayLen);
+        vec4  eclK2 = vec4(1.0, 1.0, 1.0, 0.50 * rayLen);
+        vec4  eclK3 = vec4(1.0, 1.0, 1.0, 0.75 * rayLen);
+        vec4  eclK4 = vec4(1.0, 1.0, 1.0, rayLen);
+        #ifdef ECL
+        if (eclOn)
+            AtmoEclipseConeKeys(li, x0, v, rayLen, LvecE, lightAngRad, ellips, eclK0, eclK1, eclK2, eclK3, eclK4);
+        #endif
+    #endif
+
+    vec3 segShadow[ATMO_SHADOW_STEPS];
+    vec3 minShadow = vec3(1.0);
+
+    for (int k = 0; k < ATMO_SHADOW_STEPS; k++)
+    {
+        if (k >= nSeg) break;
+
+        float ta = AtmoShadowRayT(float(k),       qa, dq, tLow, rayLen);
+        float tb = AtmoShadowRayT(float(k) + 1.0, qa, dq, tLow, rayLen);
+
+        vec3 s = vec3(1.0);
+
+        #ifdef RINGS
+        if (ringOn)
+        {
+            float r = 0.0;
+            for (int j = 0; j < ATMO_RING_POINTS; j++)
+            {
+                float tm = mix(ta, tb, (float(j) + 0.5) / float(ATMO_RING_POINTS));
+                r += AtmoRingsShadowCtx(ringCtx, x0 + v * tm, lightAngRad,
+                                        fract(float(k * ATMO_RING_POINTS + j) * 0.6180339887 + 0.25), false);
+            }
+            s *= r / float(ATMO_RING_POINTS);
+        }
+        #endif
+
+        #ifdef ECL
+        if (eclOn)
+        {
+            #if (ATMO_ECL_CONE != 0)
+                s *= AtmoEclipseConeLookup(eclK0, eclK1, eclK2, eclK3, eclK4, mix(ta, tb, 0.5));
+            #else
+                vec3 e = vec3(0.0);
+                for (int j = 0; j < ATMO_ECL_POINTS; j++)
+                {
+                    float tm = mix(ta, tb, (float(j) + 0.5) / float(ATMO_ECL_POINTS));
+                    e += AtmoEclipseAt(li, x0 + v * tm, LvecE, lightAngRad, ellips);
+                }
+                s *= e / float(ATMO_ECL_POINTS);
+            #endif
+        }
+        #endif
+
+        segShadow[k] = s;
+        minShadow    = min(minShadow, s);
+    }
+
+    // No shadow anywhere along the ray: nothing to do, keep the old result untouched
+    if (min(minShadow.r, min(minShadow.g, minShadow.b)) > 0.9995)
+        return vec3(1.0);
+
+    // Pass 2: weight of every segment = share of the light it scatters towards the eye.
+    //
+    // The sun visibility of a segment is estimated at its start, its lowest point and
+    // its end, weighted by the air density there. Past the terminator the lowest point
+    // is inside the planet's shadow while the air above it is still sunlit, and that
+    // sunlit air is what makes the twilight glow: sampling only the lowest point gave
+    // zero weight everywhere and the shadows were ignored.
+    //
+    // Two sets of weights are accumulated: with the sun ("lit") and without it ("dens").
+    // If (almost) none of the ray is sunlit, the density-only average is used instead
+    // of fading to "unshadowed", which used to keep the twilight sky lit in eclipses
+    // and ring shadows, with a different fade for every colour channel.
+    vec3  accShadow  = vec3(0.0);       // sun weighted
+    vec3  accTotal   = vec3(0.0);
+    vec3  accShadowD = vec3(0.0);       // density weighted only
+    vec3  accTotalD  = vec3(0.0);
+    vec3  tauView    = vec3(0.0);       // optical depth from the ray start to the segment start
+    float invH       = 1.0 / max(AtmoParams2.z, 1.0e-3);
+
+    float tPrev  = AtmoShadowRayT(0.0, qa, dq, tLow, rayLen);
+    vec3  pPrev  = x0 + v * tPrev;
+    float rPrev  = length(pPrev);
+    vec3  sunPrev = AtmoSunAt(pPrev, rPrev, Lvec);
+
+    for (int k = 0; k < ATMO_SHADOW_STEPS; k++)
+    {
+        if (k >= nSeg) break;
+
+        float tNext = AtmoShadowRayT(float(k) + 1.0, qa, dq, tLow, rayLen);
+        vec3  pNext = x0 + v * tNext;
+        float rNext = length(pNext);
+        vec3  sunNext = AtmoSunAt(pNext, rNext, Lvec);
+
+        // Optical depth of the segment (analytic, same formula as transmittanceAnalytic())
+        float mua = clamp(dot(pPrev, v) / rPrev, -1.0, 1.0);
+        float odR = opticalDepth(AtmoParams2.z, rPrev, mua, tNext - tPrev);
+        float odM = opticalDepth(AtmoParams2.w, rPrev, mua, tNext - tPrev);
+        if (isnan(odR)) odR = 0.0;
+        if (isnan(odM)) odM = 0.0;
+        vec3  tauSeg = (AtmoRayleigh.rgb * odR + AtmoMieExt.rgb * odM) * AtmoParams1.x;
+
+        // Sun visibility of the segment: start, lowest point, end, weighted by density
+        float rhoA = exp(min((Radiuses.x - rPrev) * invH, 30.0));
+        float rhoB = exp(min((Radiuses.x - rNext) * invH, 30.0));
+        vec3  sunL;
+        float rhoL;
+        if (tLow > tPrev && tLow < tNext)
+        {
+            vec3  pL = x0 + v * tLow;
+            float rL = length(pL);
+            sunL = AtmoSunAt(pL, rL, Lvec);
+            rhoL = exp(min((Radiuses.x - rL) * invH, 30.0));
+        }
+        else
+        {
+            bool lowA = (rPrev < rNext);
+            sunL = lowA ? sunPrev : sunNext;
+            rhoL = lowA ? rhoA : rhoB;
+        }
+        vec3  sunT = (rhoA * sunPrev + rhoL * sunL + rhoB * sunNext) / max(rhoA + rhoL + rhoB, 1.0e-30);
+
+        vec3  wD = exp(-tauView) * (vec3(1.0) - exp(-tauSeg));
+        vec3  w  = wD * sunT;
+
+        accShadow  += w  * segShadow[k];
+        accTotal   += w;
+        accShadowD += wD * segShadow[k];
+        accTotalD  += wD;
+
+        tauView += tauSeg;
+        tPrev    = tNext;
+        pPrev    = pNext;
+        rPrev    = rNext;
+        sunPrev  = sunNext;
+    }
+
+    vec3 effLit  = accShadow  / max(accTotal,  vec3(1.0e-30));
+    vec3 effDens = accShadowD / max(accTotalD, vec3(1.0e-30));
+    vec3 lit     = accTotal / max(accTotalD, vec3(1.0e-30));          // sunlit fraction of the scattering
+    vec3 eff     = mix(effDens, effLit, smoothstep(vec3(1.0e-7), vec3(1.0e-5), lit));
+    eff          = mix(vec3(1.0), eff, smoothstep(vec3(1.0e-12), vec3(1.0e-9), accTotalD));   // (almost) no air on the ray
+
+    // Defensive: a NaN or Inf here (a degenerate ray, an extreme geometry this wasn't tested
+    // against) must never reach the multiply into Inscatter -- that shows up as a blown-out
+    // white patch, not a quietly wrong number, and is much worse than losing the shadow for
+    // one pixel. Falls back to "no shadow" rather than propagate garbage.
+    if (any(isnan(eff)) || any(isinf(eff))) eff = vec3(1.0);
+
+    return mix(eff, vec3(1.0), ATMO_SHADOW_FILL);
+}
+
+//-----------------------------------------------------------------------------
+// Effective shadow along the view ray, with the rejection tests in front.
+
+//   groundShadow - shadow the caller found at the fragment the ray ends on (vec3(1.0) if
+//                  there is none): if that is in shadow, the gates are not trusted
+
+vec3    AtmoRayShadowG(int li, vec3 x0, vec3 v, float rayLen,
+                       vec3 Lvec, vec3 LvecE, float lightAngRad, vec3 ellips, float axisZ,
+                       vec3 groundShadow)
+{
+    if (rayLen < 1.0e-3) return vec3(1.0);
+
+    // Night: the original code multiplies the haze by an exact zero for this light
+    #ifdef LOPT_SKIP_NIGHT_ATMO
+        if (!LoptHazeVisible()) return vec3(1.0);
+    #endif
+
+    // Cheap rejection first: most pixels of most frames end here
+    bool eclOn   = false;
+    bool ringOn  = false;
+    bool eclAll  = false;       // every source that exists in this shader
+    bool ringAll = false;
+
+    #ifdef ECL
+        eclAll = true;
+        #ifdef ATMO_USE_ECL_GATE
+            eclOn = AtmoEclipseMayShadow(li, ellips);
+            #ifdef ATMO_USE_ECL_RAY_GATE
+                eclOn = eclOn && AtmoEclipseRayMayShadow(li, x0, v, rayLen, LvecE, lightAngRad, ellips);
+            #endif
+        #else
+            eclOn = true;
+        #endif
+    #endif
+
+    #ifdef RINGS
+        AtmoRingCtx ringCtx = AtmoRingsCtx(Lvec, ellips, axisZ);
+        ringAll = (ringCtx.equinox > 0.0);
+        #ifdef ATMO_USE_RING_GATE
+            ringOn = AtmoRingsRayMayShadow(ringCtx, x0, v, rayLen, lightAngRad);
+        #else
+            ringOn = ringAll;
+        #endif
+    #endif
+
+    // Safety net: the gates say nothing can shadow this ray, but the fragment it ends on is
+    // in shadow. Then something is off (or the shadow is deep in a penumbra), so sample.
+    #if (ATMO_GROUND_NET != 0)
+        if (!(eclOn || ringOn) && min(groundShadow.r, min(groundShadow.g, groundShadow.b)) < 0.9995)
+        {
+            eclOn  = eclAll;
+            ringOn = ringAll;
+        }
+    #endif
+
+    #if (ATMO_SHADOW_DEBUG != 0)
+        // Lift one gate at a time; if that changes the answer, that gate was wrong
+        vec3  sGate = AtmoRayShadowCore(li, x0, v, rayLen, Lvec, LvecE, lightAngRad, ellips, axisZ, eclOn,  ringOn);
+        vec3  sEcl  = AtmoRayShadowCore(li, x0, v, rayLen, Lvec, LvecE, lightAngRad, ellips, axisZ, eclAll, ringOn);
+        vec3  sRing = AtmoRayShadowCore(li, x0, v, rayLen, Lvec, LvecE, lightAngRad, ellips, axisZ, eclOn,  ringAll);
+        vec3  dEcl  = abs(sEcl  - sGate);
+        vec3  dRing = abs(sRing - sGate);
+        bool  badEcl  = max(dEcl.r,  max(dEcl.g,  dEcl.b))  > 0.02;
+        bool  badRing = max(dRing.r, max(dRing.g, dRing.b)) > 0.02;
+        if (badEcl || badRing)
+            return vec3(badEcl ? 1.0 : 0.0, badRing ? 1.0 : 0.0, 0.0);
+        return sGate;
+    #else
+        return AtmoRayShadowCore(li, x0, v, rayLen, Lvec, LvecE, lightAngRad, ellips, axisZ, eclOn, ringOn);
+    #endif
+}
+
+// Same, without a fragment shadow to check against (sky shell)
+vec3    AtmoRayShadow(int li, vec3 x0, vec3 v, float rayLen,
+                      vec3 Lvec, vec3 LvecE, float lightAngRad, vec3 ellips, float axisZ)
+{
+    return AtmoRayShadowG(li, x0, v, rayLen, Lvec, LvecE, lightAngRad, ellips, axisZ, vec3(1.0));
+}
+
+//-----------------------------------------------------------------------------
+// Shadow seen by the sky light falling on a ground point P0 (up = local vertical).
+// Skylight comes from the air above the point, not from the point itself, so
+// the shadow is sampled at two heights above it and blended with the ground shadow.
+// Terms that are certainly 1 (eclipse when no caster can reach the atmosphere) are
+// skipped; the result is otherwise the same as evaluating everything.
+
+vec3    AtmoSkyShadow(int li, vec3 P0, vec3 up, vec3 groundShadow,
+                      vec3 Lvec, vec3 LvecE, float lightAngRad, vec3 ellips, float axisZ)
+{
+    // Night: irradiance() is multiplied by MieHorFade, exactly zero here
+    #ifdef LOPT_SKIP_NIGHT_ATMO
+        if (!LoptSkyIrradVisible()) return groundShadow;
+    #endif
+
+    float hAtm = Radiuses.z;
+    vec3  s1 = vec3(1.0);
+    vec3  s2 = vec3(1.0);
+
+    #ifdef RINGS
+        AtmoRingCtx ringCtx = AtmoRingsCtx(Lvec, ellips, axisZ);
+        s1 *= AtmoRingsShadowCtx(ringCtx, P0 + up * (0.10 * hAtm), lightAngRad, 0.5, (ATMO_SKY_SHARP != 0));
+        s2 *= AtmoRingsShadowCtx(ringCtx, P0 + up * (0.40 * hAtm), lightAngRad, 0.5, (ATMO_SKY_SHARP != 0));
+    #endif
+
+    #ifdef ECL
+        #ifdef ATMO_USE_ECL_GATE
+            if (AtmoEclipseMayShadow(li, ellips))
+        #endif
+        {
+            s1 *= AtmoEclipseAt(li, P0 + up * (0.10 * hAtm), LvecE, lightAngRad, ellips);
+            s2 *= AtmoEclipseAt(li, P0 + up * (0.40 * hAtm), LvecE, lightAngRad, ellips);
+        }
+    #endif
+
+    vec3 s = 0.5 * groundShadow + 0.3 * s1 + 0.2 * s2;
+    return mix(s, vec3(1.0), ATMO_SKY_SHADOW_FILL);
+}
+
+//-----------------------------------------------------------------------------
+#endif // ATMO_RAY_SHADOW
+
+#endif // ECL || RINGS
+
+#endif // _FRAGMENT_

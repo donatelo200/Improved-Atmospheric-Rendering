@@ -204,6 +204,16 @@ const vec3  FaceBitangent = vec3(0.0, 0.01, 0.0); // step vector mask to compute
 #include "eclipse_common.glh"
 #endif
 
+// Exact per-light optimisations and the shared eclipse gates
+#include "light_opt.glh"
+
+// Path-integrated eclipse / ring shadows for the atmosphere (defines ATMO_RAY_SHADOW)
+#ifdef ATMO
+#ifdef ATMOSHADOW
+#include "atmo_shadow.glh"
+#endif
+#endif
+
 //===========================================================================//
 //                                                                           //
 //                             Vertex shader                                 //
@@ -222,6 +232,10 @@ out vec3 fTangent;
 out vec4 fTexCoord0;
 out vec4 fTexCoord1;
 out vec4 fTexCoord2;
+
+#if (defined(RINGS) && defined(ECL) && (LOPT_RINGSHINE_VERTEX != 0))
+out vec3 fRingEclAvg[MAX_LIGHTS];   // [opt] ringshine eclipse taps, computed below instead of per pixel
+#endif
 
 #if defined(EMIS) || defined(THERM)
 out vec4 fTexCoord3;
@@ -532,6 +546,63 @@ void main()
         float st = clamp(tanPhi * GlowColorAtmo.w, 0.0, 1.0);
         fPositionLocal.w = 1.0 - lt * st;
     #endif // RINGS
+
+    // [opt] ringshine eclipse taps, moved here from the fragment shader (see light_opt.glh)
+    #if (defined(RINGS) && defined(ECL) && (LOPT_RINGSHINE_VERTEX != 0))
+    {
+        vec3  poleVecV        = (SurfParams3.x == 0.0) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+        float planetRadiusV   = Radiuses.w;
+        float ringInnerV      = RingsParams.x;
+        float ringOuterV      = RingsParams.x + (1.0 / max(1.0e-6, RingsParams.w));
+        float rMidV           = (ringInnerV + ringOuterV) * 0.56;   // 0.56, matching the fragment code
+        vec3  normalV         = normalize(fPosition.xyz);
+        float fragElevV       = dot(normalV, poleVecV);
+        float rPrV            = max(1.0001, rMidV / planetRadiusV);
+        float horizonCosV     = 1.0 / rPrV;
+        const float PI_2V     = 6.28318530718;
+
+        for (int i = 0; i < NLights; i++)
+        {
+            vec3  lightPosV      = LightPos[i] - fPosition.xyz;
+            vec3  lightPosEllV   = lightPosV * EllipsGrav.xyz;
+            float invLightDistV  = inversesqrt(dot(lightPosEllV, lightPosEllV));
+            vec3  sunDirV        = normalize(lightPosV);
+            float starAngRadV    = LightParams[i].x * invLightDistV;
+
+            vec3  sunRingProjV   = sunDirV - poleVecV * dot(sunDirV, poleVecV);
+            float sunRingLenV    = length(sunRingProjV);
+            vec3  dirSunRingV    = (sunRingLenV > 1.0e-4) ? (sunRingProjV / sunRingLenV) : vec3(1.0, 0.0, 0.0);
+
+            vec3  normalRingPlaneV    = normalV - poleVecV * fragElevV;
+            float normalRingPlaneLenV = length(normalRingPlaneV);
+            vec3  dirReprV       = (normalRingPlaneLenV > 1.0e-4) ? (normalRingPlaneV / normalRingPlaneLenV) : dirSunRingV;
+
+            float deltaVisibleV  = acos(clamp(horizonCosV / max(normalRingPlaneLenV, 1.0e-4), -1.0, 1.0));
+            float eclThresholdV  = cos(deltaVisibleV);
+            vec3  dirSideRingV   = cross(poleVecV, dirSunRingV);
+
+            vec3  eclAvgV = vec3(0.0);
+            float eclWeightSumV = 0.0;
+
+            for (int t = 0; t < NUM_SECTORS; t++)
+            {
+                float ang = float(t) * (PI_2V / float(NUM_SECTORS));
+                vec3  dirSector = cos(ang) * dirSunRingV + sin(ang) * dirSideRingV;
+                float sectorDot = dot(dirReprV, dirSector);
+                float weight    = max(0.0000001, smoothstep(eclThresholdV, 1.0, sectorDot));
+
+                if (weight > 0.0000001)
+                {
+                    vec3 eclTap = LoptEclipseShadowColoredAuto(i, MAX_ECLIPSES, dirSector * rMidV, sunDirV, starAngRadV);   // vertex-safe copy, see light_opt.glh
+                    eclAvgV += eclTap * weight;
+                    eclWeightSumV += weight;
+                }
+            }
+
+            fRingEclAvg[i] = (eclWeightSumV > 0.0000001) ? (eclAvgV / eclWeightSumV) : vec3(1.0);
+        }
+    }
+    #endif
 }
 
 #endif // _VERTEX_
@@ -551,6 +622,10 @@ in vec3 fTangent;
 in vec4 fTexCoord0;
 in vec4 fTexCoord1;
 in vec4 fTexCoord2;
+
+#if (defined(RINGS) && defined(ECL) && (LOPT_RINGSHINE_VERTEX != 0))
+in vec3 fRingEclAvg[MAX_LIGHTS];   // [opt] see the vertex shader and light_opt.glh
+#endif
 
 #if defined(EMIS) || defined(THERM)
 in vec4 fTexCoord3;
@@ -1080,12 +1155,30 @@ void main()
         // Eclipse shadows & Atmospheric Refraction Tinting
         #ifdef ECL
             float lightAngularRadius = asin(clamp(LightParams[i].x * invLightDist, 0.0, 1.0));
-            vec3 eclColor = EclipseShadowColoredAuto(i, MAX_ECLIPSES, FragPosEll, lightPosEll * invLightDist, lightAngularRadius);
+            vec3 eclColor = vec3(1.0);
+            #ifdef LOPT_GATE_GROUND_ECL
+            if (LoptEclipseGround(i, EllipsGrav.xyz, Radiuses.w * (1.0 + abs(SurfParams2.x))))   // [opt] exact: skipped when no caster can reach the planet
+            #endif
+                eclColor = EclipseShadowColoredAuto(i, MAX_ECLIPSES, FragPosEll, lightPosEll * invLightDist, lightAngularRadius);
             eclFactor = mix(vec3(1.0), eclColor, AmbientColor.a);
             ShadowColor *= eclFactor;
             float eclipse = 1.0 - clamp(dot(eclColor, vec3(0.33333)), 0.0, 1.0);
             eclipse *= step(0.0, dot(lightPosEll, FragPosEll));
             EclipseMask *= 1.0 - eclipse;
+        #endif
+
+        // Shadows as seen by the atmosphere: the haze on the view ray and the skylight
+        // falling on the ground both depend on the air ABOVE the fragment, not only on
+        // the shadow at the fragment itself (which stays correct for direct light)
+        #if (defined(ATMO) && defined(ATMO_RAY_SHADOW))
+            vec3  hazeShadow = ShadowColor;
+            vec3  skyShadow  = ShadowColor;
+            {
+                vec3  lightVecE   = lightPosEll * invLightDist;
+                float lightAngRad = asin(clamp(LightParams[i].x * invLightDist, 0.0, 1.0));
+                hazeShadow = AtmoRayShadowG(i, EyePosM, eyeVec, eyeVecLength, lightVec, lightVecE, lightAngRad, EllipsGrav.xyz, SurfParams3.x, ShadowColor);
+                skyShadow  = AtmoSkyShadow(i, FragPos, Normal, ShadowColor, lightVec, lightVecE, lightAngRad, EllipsGrav.xyz, SurfParams3.x);
+            }
         #endif
 
         // Atmospheric Ringshine Illumination
@@ -1182,6 +1275,10 @@ void main()
 
             // Eclipse from other moons/planets
               #ifdef ECL
+                #if (LOPT_RINGSHINE_VERTEX != 0)
+                    // [opt] computed in the vertex shader and interpolated, see light_opt.glh
+                    ring_illum_fraction *= mix(vec3(1.0), fRingEclAvg[i], AmbientColor.a);
+                #else
                 vec3 dir_side_ring = cross(poleVec, dir_sun_ring);
                 const float PI_2 = 6.28318530718;
 
@@ -1191,6 +1288,9 @@ void main()
                 vec3 ecl_avg = vec3(0.0);
                 float ecl_weight_sum = 0.0;
 
+                #ifdef LOPT_GATE_RINGSHINE_ECL
+                if (planet_shadow > 0.0 && LoptEclipseRings(i, r_mid_m))   // [opt] exact: the taps are 1.0 unless a caster reaches the ring circle; the result is zeroed by planet_shadow otherwise
+                #endif
                 for (int t = 0; t < NUM_SECTORS; t++) {
                     float ang = float(t) * (PI_2 / float(NUM_SECTORS)); 
                     vec3 dir_sector = cos(ang) * dir_sun_ring + sin(ang) * dir_side_ring;
@@ -1207,6 +1307,7 @@ void main()
                 ecl_avg = (ecl_weight_sum > 0.0000001) ? (ecl_avg / ecl_weight_sum) : vec3(1.0);
 
                 ring_illum_fraction *= mix(vec3(1.0), ecl_avg, AmbientColor.a);
+                #endif
             #endif
 
             // Accumulate light across the 8 ring bands
@@ -1249,10 +1350,15 @@ void main()
                 EyeMuS = clamp(dot(normalize(EyePosM), ringLightDir), -1.0, 1.0);
                 MieHorFade = smoothstep(0.0, AtmoParams2.y, EyeMuS);
 
-                if (atmoHorFix)
-                    Inscatter += inscatterGroundFix(ringLightDir) * total_ring_light;
-                else
-                    Inscatter += inscatterGround(ringLightDir) * total_ring_light;
+                #ifdef LOPT_SKIP_NIGHT_ATMO
+                if (LoptHazeVisible())   // [opt] exact zero otherwise (EyeMuS was just set for the ring light)
+                #endif
+                {
+                    if (atmoHorFix)
+                        Inscatter += inscatterGroundFix(ringLightDir) * total_ring_light;
+                    else
+                        Inscatter += inscatterGround(ringLightDir) * total_ring_light;
+                }
 
                 EyeMuS = savedEyeMuS;
                 MieHorFade = savedMieHorFade;
@@ -1314,7 +1420,17 @@ void main()
 
         // Add sky irradiance
         #ifdef ATMO
-            vec3 skyIrrad = irradiance(FragH, NdotLS) * sunLight * AtmoParams1.z;
+            vec3 skyIrrad = vec3(0.0);
+            #ifdef LOPT_SKIP_NIGHT_ATMO
+            if (LoptSkyIrradVisible())   // [opt] irradiance() is multiplied by MieHorFade, exactly 0 otherwise
+            #endif
+            {
+                #ifdef ATMO_RAY_SHADOW
+                    skyIrrad = irradiance(FragH, NdotLS) * (LightColor[i].rgb * skyShadow) * AtmoParams1.z;
+                #else
+                    skyIrrad = irradiance(FragH, NdotLS) * sunLight * AtmoParams1.z;
+                #endif
+            }
             #if (defined(AWATER) || defined(EMIS))
                 sunLightW += skyIrrad;
             #endif
@@ -1346,6 +1462,10 @@ void main()
 
         #if (!defined(ACLOUDS) && (defined(AWATER) || defined(AICE)))
 
+            #ifdef LOPT_SKIP_NIGHT_BRDF
+            if (HorShadow > 0.0)   // [opt] the BRDF terms are only multiplied by the direct light, which is exactly 0 when HorShadow is
+            {
+            #endif
             // Cook-Torrance BRDF (terrain, sea bottom)
             CookTorranceBRDF(normVec, eyeVecTS, lightVecTS, NdotV, NdotL,
                              diffColor.rgb, roughTer, aoTer, metallic,
@@ -1359,6 +1479,10 @@ void main()
                 diffSeaTerm, specSeaTerm);
 
         #endif
+
+            #ifdef LOPT_SKIP_NIGHT_BRDF
+            }
+            #endif
 
         #else // (!defined(ACLOUDS) && (defined(AWATER) || defined(AICE)))
 
@@ -1394,10 +1518,20 @@ void main()
 
         // Calculate the atmospheric scattering along ray from ground to observer
         #ifdef ATMO
-            if (atmoHorFix)
-                Inscatter += inscatterGroundFix(lightVec) * sunLight;
-            else
-                Inscatter += inscatterGround(lightVec) * sunLight;
+            #ifdef ATMO_RAY_SHADOW
+                vec3 hazeLight = LightColor[i].rgb * hazeShadow;
+            #else
+                vec3 hazeLight = sunLight;
+            #endif
+            #ifdef LOPT_SKIP_NIGHT_ATMO
+            if (LoptHazeVisible())   // [opt] the original multiplies the haze by an exact zero here
+            #endif
+            {
+                if (atmoHorFix)
+                    Inscatter += inscatterGroundFix(lightVec) * hazeLight;
+                else
+                    Inscatter += inscatterGround(lightVec) * hazeLight;
+            }
         #endif
     }
 

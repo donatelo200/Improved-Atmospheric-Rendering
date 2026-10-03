@@ -45,6 +45,9 @@ const float MIN_MU_S = 0.2;
 // Comment to use fix for Mie only (but this causes thick atmospheres glow
 // on the night side of the planet).
 //#define HOR_FIX_ALL
+#include "Atmo_config.glh"
+
+
 //-----------------------------------------------------------------------------
 
 vec4 texture4D(float r, float mu, float muS, float tex4Dlerpi, float tex4Dlerpf)

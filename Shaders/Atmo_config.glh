@@ -2,6 +2,7 @@
 
 // Ringshine Quality settings
 #define NUM_BANDS  8		// Determins amount of loops for overall lighting.
-#define NUM_SECTORS  16		// Number of sections for Eclipses and midnight darkening.  I would reccomend keeping this below 64 as it will impact performance.
+#define NUM_SECTORS  8		// Number of sections for Eclipses and midnight darkening.  I would reccomend keeping this below 64 as it will impact performance.
 
-
+#define ATMOSHADOW
+#define RINGSHINE

@@ -20,8 +20,6 @@ precision highp float;
 #define DUST_RINGS_DETAILED_NOISE
 //#define DUST_RINGS_DETAILED_NOISE_AZIMUTAL
 
-#define RINGSHINE
-
 
 //-----------------------------------------------------------------------------
 #ifdef RINGS_NOISE_CODE
